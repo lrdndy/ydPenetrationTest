@@ -1,0 +1,54 @@
+#pragma once
+#include "core/Common.h"
+#include "core/Logger.h"
+#include "ydApi.h"
+
+namespace ydtest {
+class YdSession : public YDListener {
+public:
+    YdSession(std::string config, std::string username, std::string password, Logger& log);
+    ~YdSession() override;
+    bool start();
+    void stop();
+    bool waitConnected(int sec);
+    bool waitDisconnected(int sec);
+    bool waitLogin(int sec);
+    bool waitInit(int sec);
+    bool waitCaughtUp(int sec);
+    bool waitMarketData(int instrumentRef, int sec, YDMarketData& out);
+    const YDInstrument* instrument(const std::string& id) const;
+    bool subscribe(const YDInstrument* inst);
+    int sendLimitOrder(const YDInstrument* inst,int direction,int offset,double price,int volume,int hedge=YD_HF_Speculation);
+    bool cancelOrder(const YDInstrument* inst,const YDOrder& order);
+    bool cancelMulti(const std::vector<std::pair<const YDInstrument*,YDOrder>>& orders);
+    bool waitOrder(int orderRef,int sec,const std::function<bool(const YDOrder&)>& pred,YDOrder& out);
+    bool waitTrade(int orderRef,int sec,YDTrade& out);
+    void disconnectNow();
+    int loginError() const;
+    int maxOrderRef() const;
+    YDApi* api() const { return api_; }
+
+    void notifyAfterApiDestroy() override;
+    void notifyEvent(int apiEvent) override;
+    void notifyReadyForLogin(bool hasLoginFailed) override;
+    void notifyLogin(int errorNo,int maxOrderRef,bool isMonitor) override;
+    void notifyFinishInit() override;
+    void notifyCaughtUp() override;
+    void notifyOrder(const YDOrder*,const YDInstrument*,const YDAccount*) override;
+    void notifyTrade(const YDTrade*,const YDInstrument*,const YDAccount*) override;
+    void notifyFailedCancelOrder(const YDFailedCancelOrder*,const YDExchange*,const YDAccount*) override;
+    void notifyMarketData(const YDMarketData*) override;
+private:
+    template<class Pred> bool waitState(int sec, Pred p){ std::unique_lock<std::mutex> lk(mu_); return cv_.wait_for(lk,std::chrono::seconds(sec),p); }
+    std::string config_,username_,password_;
+    Logger& log_;
+    YDApi* api_=nullptr;
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    bool connected_=false,disconnectedSeen_=false,loginDone_=false,initDone_=false,caughtUp_=false,destroyed_=false,destroying_=false;
+    int loginError_=-999,maxOrderRef_=0,nextOrderRef_=1;
+    std::unordered_map<int,YDOrder> orders_;
+    std::vector<YDTrade> trades_;
+    std::unordered_map<int,YDMarketData> market_;
+};
+}

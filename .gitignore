@@ -1,0 +1,6 @@
+build/
+output/
+log/
+config/accounts.local.csv
+*.user
+.vs/
