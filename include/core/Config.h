@@ -27,8 +27,10 @@ struct RunOptions {
     std::string accounts = "config/accounts.local.csv";
     std::string instrument;
     std::string caseName;
+    std::string logDate;
     std::string outputRoot = "output";
     bool live = false;
+    bool interactive = false;
 };
 
 RunOptions parseArgs(int argc, char** argv);

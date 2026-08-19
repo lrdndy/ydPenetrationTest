@@ -2,5 +2,7 @@ build/
 output/
 log/
 config/accounts.local.csv
+config/accounts.yida.local.csv
+config/yd_config.local.txt
 *.user
 .vs/

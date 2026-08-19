@@ -1,6 +1,7 @@
 #pragma once
 #include "core/Common.h"
 #include "core/Logger.h"
+#include "core/Monitor.h"
 #include "ydApi.h"
 
 namespace ydtest {
@@ -31,6 +32,13 @@ struct OrderActivitySnapshot {
     std::uint64_t callbackValidationFailures=0;
 };
 
+struct BatchCancelActivitySnapshot {
+    std::uint64_t apiCalls=0;
+    std::uint64_t apiCallsSubmitted=0;
+    std::uint64_t targetOrdersRequested=0;
+    std::uint64_t targetOrdersSubmitted=0;
+};
+
 struct OrderStreamSnapshot {
     OrderActivitySnapshot activity;
     std::uint64_t activityGeneration=0;
@@ -42,9 +50,20 @@ struct OrderStreamSnapshot {
     std::unordered_map<int,std::int64_t> tradeVolumeByOrderRef;
 };
 
+struct InstructionValidationSnapshot {
+    std::uint64_t invalidInstrument=0;
+    std::uint64_t invalidLimitPrice=0;
+    std::uint64_t invalidLimitVolume=0;
+};
+
+struct TradingControlSnapshot {
+    bool paused=false;
+    std::uint64_t blockedOrderInstructions=0;
+};
+
 class YdSession : public YDListener {
 public:
-    YdSession(std::string config, std::string username, std::string password, Logger& log, bool useExtendedApi = false);
+    YdSession(std::string config, std::string username, std::string password, Logger& log, bool useExtendedApi = false, MonitorThresholds monitorThresholds = {}, bool liveOrderSubmissionEnabled = false);
     ~YdSession() override;
     bool start();
     void stop();
@@ -59,6 +78,8 @@ public:
     bool waitLoginAfter(std::uint64_t generation,int sec);
     bool waitCaughtUpAfter(std::uint64_t generation,int sec);
     OrderActivitySnapshot orderActivity() const;
+    BatchCancelActivitySnapshot batchCancelActivity() const;
+    InstructionValidationSnapshot instructionValidation() const;
     OrderStreamSnapshot orderStreamSnapshot() const;
     bool waitOrderActivityQuiet(int quietMilliseconds,int maxSeconds,OrderStreamSnapshot& out);
     bool stopIfOrderStreamUnchanged(std::uint64_t activityGeneration,std::uint64_t sessionGeneration,OrderStreamSnapshot& out);
@@ -66,6 +87,10 @@ public:
     bool waitNextMarketData(int instrumentRef, std::uint64_t& version, int sec, YDMarketData& out);
     const YDInstrument* instrument(const std::string& id) const;
     bool subscribe(const YDInstrument* inst);
+    void pauseTrading(const std::string& source="MANUAL");
+    void resumeTrading(const std::string& source="MANUAL");
+    TradingControlSnapshot tradingControl() const;
+    int sendLimitOrder(const std::string& instrumentId,int direction,int offset,double price,int volume,int hedge=YD_HF_Speculation);
     int sendLimitOrder(const YDInstrument* inst,int direction,int offset,double price,int volume,int hedge=YD_HF_Speculation);
     bool cancelOrder(const YDInstrument* inst,const YDOrder& order);
     bool cancelMulti(const std::vector<std::pair<const YDInstrument*,YDOrder>>& orders);
@@ -121,11 +146,25 @@ private:
         int errorNo=0;
     };
     template<class Pred> bool waitState(int sec, Pred p){ std::unique_lock<std::mutex> lk(mu_); return cv_.wait_for(lk,std::chrono::seconds(sec),p); }
-    std::string config_,username_,password_;
+    int sendLimitOrderUnlocked(const YDInstrument* inst,const std::string& instrumentId,int direction,int offset,double price,int volume,int hedge);
+    bool rejectOrderWhilePaused(const std::string& instrumentId,int direction,int offset,double price,int volume);
+    void logInstructionRejected(const std::string& validation,const std::string& instrumentId,int direction,int offset,double price,int volume,const std::string& reason);
+    void logInstructionMonitoringSummary();
+    std::string config_,username_,password_,appId_;
     Logger& log_;
+    Monitor instructionMonitor_;
+    TradingGate tradingGate_;
+    mutable std::mutex tradingControlMu_;
+    std::string tradingPauseSource_="NONE";
+    std::uint64_t blockedOrderInstructions_=0;
+    bool instructionMonitoringSummaryLogged_=false;
     bool useExtendedApi_=false;
+    bool liveOrderSubmissionEnabled_=false;
     YDApi* api_=nullptr;
     YDExtendedApi* extendedApi_=nullptr;
+    std::mutex apiLifecycleMu_;
+    std::condition_variable apiLifecycleCv_;
+    std::size_t activeLoginApiCalls_=0;
     mutable std::mutex mu_;
     std::condition_variable cv_;
     bool connected_=false,disconnectedSeen_=false,loginDone_=false,initDone_=false,caughtUp_=false,destroyed_=false,destroying_=false;
@@ -137,8 +176,11 @@ private:
     std::set<int> acceptedOrderRefs_;
     std::uint64_t orderApiRequests_=0,orderRequestsSubmitted_=0;
     std::uint64_t cancelApiRequests_=0,cancelRequestsSubmitted_=0;
+    std::uint64_t batchCancelApiCalls_=0,batchCancelApiCallsSubmitted_=0;
+    std::uint64_t batchCancelOrdersRequested_=0,batchCancelOrdersSubmitted_=0;
     std::uint64_t confirmedCancellations_=0,failedCancelCallbacks_=0;
     std::uint64_t callbackValidationFailures_=0,orderActivityGeneration_=0;
+    std::uint64_t invalidInstrumentInstructions_=0,invalidLimitPriceInstructions_=0,invalidLimitVolumeInstructions_=0;
     std::uint64_t orderCallbackGeneration_=0,nextCancelAttemptId_=1;
     std::uint64_t eventGeneration_=0,tradeConnectedGeneration_=0,tradeDisconnectedGeneration_=0,loginGeneration_=0,caughtUpGeneration_=0;
     std::string tradeConnectedTime_,tradeDisconnectedTime_,loginTime_,caughtUpTime_;

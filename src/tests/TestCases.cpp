@@ -1,13 +1,16 @@
 #include "tests/TestCases.h"
 #include "core/Logger.h"
 #include "core/Monitor.h"
-#include "core/OrderValidator.h"
 #include "core/TestResult.h"
 #include "core/YdSession.h"
 #include "ydError.h"
 #include <cfloat>
+#include <climits>
 #include <cmath>
 #include <memory>
+#ifdef _WIN32
+#include <conio.h>
+#endif
 
 namespace ydtest {
 namespace {
@@ -15,8 +18,347 @@ struct Env { Config cfg; std::string runStamp; std::filesystem::path root; std::
 Env makeEnv(const RunOptions& o){Env e; if(!e.cfg.load(o.testConfig)) throw std::runtime_error("cannot load test config: "+o.testConfig);e.runStamp=timestampForPath();e.root=std::filesystem::path(o.outputRoot)/e.runStamp;e.accounts=loadAccountsCsv(o.accounts);if(e.accounts.empty())throw std::runtime_error("no accounts in "+o.accounts);return e;}
 std::string instID(const RunOptions& o,const Config& c){return o.instrument.empty()?c.get("Test.Instrument","au2612"):o.instrument;}
 int timeout(const Config& c){return c.getInt("Test.TimeoutSeconds",12);}
+MonitorThresholds monitorThresholds(const Config& c){return {std::max(0,c.getInt("Threshold.OrderCount",0)),std::max(0,c.getInt("Threshold.CancelCount",0)),std::max(0,c.getInt("Threshold.DuplicateCount",0)),c.getBool("Threshold.PopupEnabled",false)};}
 std::filesystem::path accountLog(const Env& e,const std::string& id,const Account& a){return e.root/id/(a.label.empty()?a.username:a.label)/"test.log";}
 int combine(int acc,int code){return (acc||code)?1:0;}
+
+struct ArchivedLogEvidence {
+    bool found=false;
+    std::filesystem::path file;
+    std::string record;
+    std::filesystem::file_time_type modified{};
+};
+
+struct ArchivedLifecycleEvidence {
+    bool found=false;
+    std::filesystem::path file;
+    std::string started;
+    std::string login;
+    std::string shutdown;
+    std::filesystem::file_time_type modified{};
+};
+
+struct ArchivedLogScan {
+    std::size_t filesScanned=0;
+    ArchivedLogEvidence trade;
+    ArchivedLifecycleEvidence lifecycle;
+    ArchivedLogEvidence monitoring;
+    ArchivedLogEvidence cabinetError;
+};
+
+std::optional<std::string> logField(const std::string& line,const std::string& name){
+    const std::string prefix=name+'=';
+    const auto begin=line.find(prefix);
+    if(begin==std::string::npos)return std::nullopt;
+    const auto valueBegin=begin+prefix.size();
+    auto valueEnd=valueBegin;
+    while(valueEnd<line.size()&&!std::isspace(static_cast<unsigned char>(line[valueEnd]))&&line[valueEnd]!='|')++valueEnd;
+    if(valueEnd==valueBegin)return std::nullopt;
+    return line.substr(valueBegin,valueEnd-valueBegin);
+}
+
+std::optional<long long> logIntegerField(const std::string& line,const std::string& name){
+    const auto value=logField(line,name);
+    if(!value)return std::nullopt;
+    try{
+        std::size_t parsed=0;
+        const long long number=std::stoll(*value,&parsed);
+        if(parsed!=value->size())return std::nullopt;
+        return number;
+    }catch(...){return std::nullopt;}
+}
+
+bool logFlag(const std::string& line,const std::string& name,bool expected=true){
+    const auto value=logField(line,name);
+    return value&&*value==(expected?"true":"false");
+}
+
+std::optional<std::string> archivedRecordDate(const std::string& line){
+    if(line.size()<11||line[0]!='['||line[5]!='-'||line[8]!='-')return std::nullopt;
+    for(const int index:{1,2,3,4,6,7,9,10})if(!std::isdigit(static_cast<unsigned char>(line[index])))return std::nullopt;
+    return line.substr(1,10);
+}
+
+std::string normalizeArchiveDate(const std::string& value){
+    if(value.empty())return {};
+    std::string compact;
+    for(const char ch:value)if(ch!='-')compact.push_back(ch);
+    if(compact.size()!=8||!std::all_of(compact.begin(),compact.end(),[](char ch){return std::isdigit(static_cast<unsigned char>(ch));}))
+        throw std::runtime_error("--log-date must use YYYYMMDD or YYYY-MM-DD");
+    const int year=std::stoi(compact.substr(0,4)),month=std::stoi(compact.substr(4,2)),day=std::stoi(compact.substr(6,2));
+    std::tm calendar{};calendar.tm_year=year-1900;calendar.tm_mon=month-1;calendar.tm_mday=day;calendar.tm_hour=12;calendar.tm_isdst=-1;
+    if(std::mktime(&calendar)==static_cast<std::time_t>(-1)||calendar.tm_year!=year-1900||calendar.tm_mon!=month-1||calendar.tm_mday!=day)
+        throw std::runtime_error("--log-date is not a valid calendar date");
+    return compact.substr(0,4)+'-'+compact.substr(4,2)+'-'+compact.substr(6,2);
+}
+
+std::string absolutePathText(const std::filesystem::path& path){
+    std::error_code ec;
+    const auto absolute=std::filesystem::absolute(path,ec);
+    return (ec?path:absolute).lexically_normal().string();
+}
+
+void chooseLatest(ArchivedLogEvidence& target,const std::filesystem::path& file,const std::string& record,const std::filesystem::file_time_type modified){
+    if(!target.found||modified>=target.modified){target={true,file,record,modified};}
+}
+
+void chooseLatest(ArchivedLifecycleEvidence& target,const std::filesystem::path& file,const std::string& started,const std::string& login,const std::string& shutdown,const std::filesystem::file_time_type modified){
+    if(!target.found||modified>=target.modified){target={true,file,started,login,shutdown,modified};}
+}
+
+bool tradingArchiveId(const std::string& id){return id=="2.2_basic_trade"||id=="2.4_order_cancel_count"||id=="2.10_batch_cancel";}
+bool errorArchiveId(const std::string& id){return id=="2.8.1_insufficient_funds"||id=="2.8.2_no_position"||id=="2.8.3_market_state"||id=="2.8_error_message";}
+bool evidenceArchiveId(const std::string& id){return tradingArchiveId(id)||errorArchiveId(id);}
+bool logAccountIs(const std::string& line,const std::string& account){const auto value=logField(line,"account");return value&&*value==account;}
+bool logHasAccount(const std::string& line){return logField(line,"account").has_value();}
+bool validArchiveRunStamp(const std::string& value){
+    if(value.size()!=15||value[8]!='_')return false;
+    for(std::size_t index=0;index<value.size();++index)if(index!=8&&!std::isdigit(static_cast<unsigned char>(value[index])))return false;
+    return true;
+}
+
+std::optional<std::string> completeLifecycleDate(const std::vector<std::string>& records,const std::string& account){
+    const std::size_t missing=records.size();
+    std::size_t started=missing,connected=missing,login=missing,init=missing,caughtUp=missing,destroyed=missing;
+    bool containsExample=false;
+    for(std::size_t index=0;index<records.size();++index){
+        const auto& record=records[index];
+        containsExample=containsExample||record.find("example")!=std::string::npos;
+        if(record.find("[SYSTEM] YD API started;")!=std::string::npos)started=index;
+        if(record.find("[API_EVENT]")!=std::string::npos&&record.find("eventName=TCP_TRADE_CONNECTED")!=std::string::npos&&logAccountIs(record,account))connected=index;
+        if(record.find("[LOGIN] login OK account=")!=std::string::npos&&logAccountIs(record,account))login=index;
+        if(record.find("[SYSTEM] notifyFinishInit: static data ready")!=std::string::npos)init=index;
+        if(record.find("[SYSTEM] notifyCaughtUp: history caught up account=")!=std::string::npos&&logAccountIs(record,account))caughtUp=index;
+        if(record.find("[SYSTEM] YD API destroyed")!=std::string::npos)destroyed=index;
+    }
+    if(containsExample||!(started<connected&&connected<login&&login<init&&init<caughtUp&&caughtUp<destroyed))return std::nullopt;
+    return archivedRecordDate(records[started]);
+}
+
+std::string latestArchivedBusinessDate(const std::filesystem::path& archiveRoot,const std::filesystem::path& currentLog,const std::string& accountDirectory,const std::string& account){
+    std::string latest;
+    std::error_code ec;
+    const auto currentAbsolute=std::filesystem::absolute(currentLog,ec).lexically_normal();
+    ec.clear();
+    std::filesystem::recursive_directory_iterator it(archiveRoot,std::filesystem::directory_options::skip_permission_denied,ec),end;
+    while(!ec&&it!=end){
+        const auto entry=*it;
+        it.increment(ec);
+        if(ec){ec.clear();continue;}
+        const std::string testId=entry.path().parent_path().parent_path().filename().string();
+        const std::string runStamp=entry.path().parent_path().parent_path().parent_path().filename().string();
+        std::error_code typeError;
+        if(entry.is_symlink(typeError)||typeError||!entry.is_regular_file(typeError)||typeError||entry.path().filename()!="test.log"
+            ||entry.path().parent_path().filename()!=accountDirectory||!evidenceArchiveId(testId)||!validArchiveRunStamp(runStamp))continue;
+        std::error_code absoluteError;
+        if(std::filesystem::absolute(entry.path(),absoluteError).lexically_normal()==currentAbsolute)continue;
+        std::error_code stateError;
+        const auto sizeBefore=std::filesystem::file_size(entry.path(),stateError);
+        if(stateError||sizeBefore>64ULL*1024ULL*1024ULL)continue;
+        const auto modifiedBefore=std::filesystem::last_write_time(entry.path(),stateError);
+        if(stateError)continue;
+        std::ifstream input(entry.path());
+        if(!input)continue;
+        std::vector<std::string> records;
+        std::string line;
+        while(std::getline(input,line))records.push_back(std::move(line));
+        const auto sizeAfter=std::filesystem::file_size(entry.path(),stateError);
+        if(stateError)continue;
+        const auto modifiedAfter=std::filesystem::last_write_time(entry.path(),stateError);
+        if(stateError||sizeBefore!=sizeAfter||modifiedBefore!=modifiedAfter)continue;
+        std::vector<std::string> session;
+        const auto inspectSession=[&](){
+            const auto date=completeLifecycleDate(session,account);
+            if(date&&*date>latest)latest=*date;
+        };
+        for(const auto& record:records){
+            if(record.find("[SYSTEM] YD API started;")!=std::string::npos){inspectSession();session.clear();}
+            if(!session.empty()||record.find("[SYSTEM] YD API started;")!=std::string::npos)session.push_back(record);
+        }
+        inspectSession();
+    }
+    return latest;
+}
+
+void analyzeArchivedSession(const std::vector<std::string>& records,const std::filesystem::path& file,const std::string& testId,const std::string& account,const std::filesystem::file_time_type modified,ArchivedLogScan& scan){
+    bool containsExample=false,manualActionRequired=false;
+    std::string apiStarted,tradeConnected,login,init,caughtUp,destroyed,riskStatistics,safeLiveFinal,errorFinal,finalErrorAccount;
+    std::set<std::string> submittedRefs,confirmedCancelRefs;
+    std::map<std::string,std::string> orderCallbacks,orderResults,batchCancelResults,tradeCallbacks;
+    std::map<std::string,std::pair<long long,std::string>> errorCallbacks;
+    bool cancelRequestSubmitted=false;
+    long long finalErrorNo=0;
+    const std::size_t noPosition=records.size();
+    std::size_t apiStartedAt=noPosition,tradeConnectedAt=noPosition,loginAt=noPosition,initAt=noPosition,caughtUpAt=noPosition,destroyedAt=noPosition;
+
+    for(std::size_t recordIndex=0;recordIndex<records.size();++recordIndex){
+        const auto& record=records[recordIndex];
+        containsExample=containsExample||record.find("example")!=std::string::npos;
+        manualActionRequired=manualActionRequired||record.find("MANUAL ACTION REQUIRED")!=std::string::npos;
+        if(record.find("[SYSTEM] YD API started;")!=std::string::npos){apiStarted=record;apiStartedAt=recordIndex;}
+        if(record.find("[API_EVENT]")!=std::string::npos&&record.find("eventName=TCP_TRADE_CONNECTED")!=std::string::npos&&logAccountIs(record,account)){tradeConnected=record;tradeConnectedAt=recordIndex;}
+        if(record.find("[LOGIN] login OK account=")!=std::string::npos&&logAccountIs(record,account)){login=record;loginAt=recordIndex;}
+        if(record.find("[SYSTEM] notifyFinishInit: static data ready")!=std::string::npos){init=record;initAt=recordIndex;}
+        if(record.find("[SYSTEM] notifyCaughtUp: history caught up account=")!=std::string::npos&&logAccountIs(record,account)){caughtUp=record;caughtUpAt=recordIndex;}
+        if(record.find("[SYSTEM] YD API destroyed")!=std::string::npos){destroyed=record;destroyedAt=recordIndex;}
+
+        const auto orderRef=logField(record,"orderRef");
+        const auto ref=logField(record,"ref");
+        const auto orderRequestsSubmitted=logIntegerField(record,"orderRequestsSubmitted");
+        if(record.find("[MONITOR]")!=std::string::npos&&record.find("activity=ORDER_API_REQUEST")!=std::string::npos
+            &&logAccountIs(record,account)&&logFlag(record,"apiReturned")&&orderRef&&orderRequestsSubmitted&&*orderRequestsSubmitted>0)submittedRefs.insert(*orderRef);
+
+        const auto errorNo=logIntegerField(record,"errorNo");
+        const bool cabinetOrderState=record.find("status=ACCEPTED(")!=std::string::npos||record.find("status=QUEUING(")!=std::string::npos
+            ||record.find("status=ALL_TRADED(")!=std::string::npos||record.find("status=CANCELED(")!=std::string::npos;
+        if(record.find("[ORDER] notifyOrder account=")!=std::string::npos&&logHasAccount(record)&&ref&&errorNo&&*errorNo==0
+            &&cabinetOrderState&&record.find("instrument=")!=std::string::npos)orderCallbacks[*ref]=record;
+        if(record.find("[ORDER_RESULT]")!=std::string::npos&&logHasAccount(record)&&orderRef&&errorNo&&*errorNo==0
+            &&record.find("instrument=")!=std::string::npos)orderResults[*orderRef]=record;
+        if(record.find("[ORDER]")!=std::string::npos&&record.find("event=BATCH_CANCEL_RESULT")!=std::string::npos&&logHasAccount(record)&&orderRef
+            &&record.find("instrument=")!=std::string::npos&&record.find("status=CANCELED")!=std::string::npos)batchCancelResults[*orderRef]=record;
+        const auto tradeId=logIntegerField(record,"tradeId");
+        const auto orderSysId=logIntegerField(record,"orderSysId");
+        if(record.find("[TRADE] notifyTrade account=")!=std::string::npos&&logHasAccount(record)&&ref&&tradeId&&*tradeId>0&&orderSysId&&*orderSysId>0)tradeCallbacks[*ref]=record;
+
+        const auto cancelRequestsSubmitted=logIntegerField(record,"cancelRequestsSubmitted");
+        if(record.find("[MONITOR]")!=std::string::npos&&logAccountIs(record,account)
+            &&(record.find("activity=CANCEL_API_REQUEST")!=std::string::npos||record.find("activity=BATCH_CANCEL_API_REQUEST")!=std::string::npos)
+            &&logFlag(record,"apiReturned")&&cancelRequestsSubmitted&&*cancelRequestsSubmitted>0)cancelRequestSubmitted=true;
+        const auto confirmedCancellations=logIntegerField(record,"confirmedCancellations");
+        if(record.find("[MONITOR]")!=std::string::npos&&record.find("activity=CANCELLATION_CONFIRMED")!=std::string::npos
+            &&logHasAccount(record)&&orderRef&&confirmedCancellations&&*confirmedCancellations>0)confirmedCancelRefs.insert(*orderRef);
+
+        const auto orderCount=logIntegerField(record,"orderCount");
+        const auto cancelCount=logIntegerField(record,"cancelCount");
+        if(record.find("[MONITOR]")!=std::string::npos&&record.find("event=RISK_STATISTICS")!=std::string::npos&&logAccountIs(record,account)
+            &&orderCount&&*orderCount>0&&cancelCount&&*cancelCount>0)riskStatistics=record;
+
+        const auto failedCancelCallbacks=logIntegerField(record,"failedCancelCallbacks");
+        const auto callbackValidationFailures=logIntegerField(record,"callbackValidationFailures");
+        const auto unexpectedTradeVolume=logIntegerField(record,"unexpectedTradeVolume");
+        const auto orderApiRequests=logIntegerField(record,"orderApiRequests");
+        const auto uniqueAcceptedOrders=logIntegerField(record,"uniqueAcceptedOrders");
+        const auto cancelApiRequests=logIntegerField(record,"cancelApiRequests");
+        const auto cleanupOrderApiRequests=logIntegerField(record,"cleanupOrderApiRequests");
+        const auto cleanupCancelApiRequests=logIntegerField(record,"cleanupCancelApiRequests");
+        const auto unresolvedRefs=logField(record,"unresolvedRefs");
+        const bool commonSafeStatistics=logHasAccount(record)&&logFlag(record,"cleanupRestored")&&logFlag(record,"streamStableThroughStop")
+            &&logFlag(record,"callbackStreamQuiet")&&logFlag(record,"tradeVolumeConsistent")
+            &&orderRequestsSubmitted&&*orderRequestsSubmitted>0&&cancelRequestsSubmitted&&*cancelRequestsSubmitted>0
+            &&confirmedCancellations&&*confirmedCancellations>0&&failedCancelCallbacks&&*failedCancelCallbacks==0
+            &&callbackValidationFailures&&*callbackValidationFailures==0&&unexpectedTradeVolume&&*unexpectedTradeVolume==0
+            &&orderApiRequests&&*orderApiRequests==*orderRequestsSubmitted&&uniqueAcceptedOrders&&*uniqueAcceptedOrders==*orderRequestsSubmitted
+            &&cancelApiRequests&&*cancelApiRequests==*cancelRequestsSubmitted&&*confirmedCancellations==*cancelRequestsSubmitted
+            &&cleanupOrderApiRequests&&*cleanupOrderApiRequests==0&&cleanupCancelApiRequests&&*cleanupCancelApiRequests==0
+            &&unresolvedRefs&&*unresolvedRefs=="none";
+        const bool countStatistics=record.find("[INFO] [COUNT_RESULT] status=PASS")!=std::string::npos&&commonSafeStatistics;
+        const auto batchSize=logIntegerField(record,"batchSize");
+        const auto batchApiCalls=logIntegerField(record,"batchApiCalls");
+        const auto batchApiCallsSubmitted=logIntegerField(record,"batchApiCallsSubmitted");
+        const auto batchTargetOrders=logIntegerField(record,"batchTargetOrders");
+        const auto batchTargetOrdersSubmitted=logIntegerField(record,"batchTargetOrdersSubmitted");
+        const auto canceledOrders=logIntegerField(record,"canceledOrders");
+        const auto ownedNetLong=logIntegerField(record,"ownedNetLong");
+        const bool batchStatistics=record.find("[INFO] [BATCH_CANCEL]")!=std::string::npos&&record.find("event=BATCH_CANCEL_STATISTICS")!=std::string::npos
+            &&commonSafeStatistics&&logFlag(record,"batchApiReturned")&&batchSize&&*batchSize==2&&batchApiCalls&&*batchApiCalls==1
+            &&batchApiCallsSubmitted&&*batchApiCallsSubmitted==1&&batchTargetOrders&&*batchTargetOrders==2
+            &&batchTargetOrdersSubmitted&&*batchTargetOrdersSubmitted==2&&orderRequestsSubmitted&&*orderRequestsSubmitted==2
+            &&cancelRequestsSubmitted&&*cancelRequestsSubmitted==2&&confirmedCancellations&&*confirmedCancellations==2
+            &&canceledOrders&&*canceledOrders==2&&logFlag(record,"noWorkingOrders")&&ownedNetLong&&*ownedNetLong==0&&logFlag(record,"positionRestored");
+        if(countStatistics||batchStatistics)safeLiveFinal=record;
+
+        const auto receivedErrors=logIntegerField(record,"receivedErrors");
+        const auto lastErrorNo=logIntegerField(record,"lastErrorNo");
+        const auto statisticsAccount=logField(record,"account");
+        if(record.find("[INFO] [ERROR_MONITOR]")!=std::string::npos&&record.find("event=ORDER_ERROR_STATISTICS")!=std::string::npos&&statisticsAccount&&receivedErrors&&*receivedErrors>0
+            &&lastErrorNo&&*lastErrorNo>0&&record.find("source=notifyOrder")!=std::string::npos
+            &&logFlag(record,"noWorkingOrders")&&logFlag(record,"streamStableThroughStop")&&logFlag(record,"accountStateNormal")){errorFinal=record;finalErrorNo=*lastErrorNo;finalErrorAccount=*statisticsAccount;}
+        if(record.find("event=ORDER_REJECTED source=notifyOrder")!=std::string::npos&&logHasAccount(record)&&ref&&errorNo&&*errorNo>0
+            &&record.find("instrument=")!=std::string::npos)errorCallbacks[*ref]={*errorNo,record};
+    }
+
+    const bool lifecycleComplete=!containsExample&&apiStartedAt<tradeConnectedAt&&tradeConnectedAt<loginAt&&loginAt<initAt&&initAt<caughtUpAt&&caughtUpAt<destroyedAt;
+    if(!lifecycleComplete)return;
+    chooseLatest(scan.lifecycle,file,apiStarted,login,destroyed,modified);
+
+    if(tradingArchiveId(testId)&&!manualActionRequired&&!safeLiveFinal.empty()){
+        for(const auto& submittedRef:submittedRefs){
+            const auto& value=submittedRef;
+            std::string businessRecord;
+            if(const auto found=tradeCallbacks.find(value);found!=tradeCallbacks.end())businessRecord=found->second;
+            else if(const auto found=orderResults.find(value);found!=orderResults.end())businessRecord=found->second;
+            else if(const auto found=orderCallbacks.find(value);found!=orderCallbacks.end())businessRecord=found->second;
+            else if(const auto found=batchCancelResults.find(value);found!=batchCancelResults.end())businessRecord=found->second;
+            if(!businessRecord.empty()){chooseLatest(scan.trade,file,businessRecord,modified);break;}
+        }
+        bool confirmedSubmittedCancellation=false;
+        for(const auto& refValue:confirmedCancelRefs)if(submittedRefs.count(refValue)){confirmedSubmittedCancellation=true;break;}
+        if(cancelRequestSubmitted&&confirmedSubmittedCancellation&&!riskStatistics.empty())chooseLatest(scan.monitoring,file,riskStatistics,modified);
+    }
+
+    if(errorArchiveId(testId)&&!manualActionRequired&&!errorFinal.empty()){
+        for(const auto& callback:errorCallbacks){
+            const auto callbackAccount=logField(callback.second.second,"account");
+            if(submittedRefs.count(callback.first)&&callback.second.first==finalErrorNo&&callbackAccount&&*callbackAccount==finalErrorAccount){chooseLatest(scan.cabinetError,file,callback.second.second,modified);break;}
+        }
+    }
+}
+
+ArchivedLogScan scanArchivedLogs(const std::filesystem::path& archiveRoot,const std::filesystem::path& currentLog,const std::string& accountDirectory,const std::string& account,const std::string& businessDate){
+    ArchivedLogScan scan;
+    std::error_code ec;
+    const auto currentAbsolute=std::filesystem::absolute(currentLog,ec).lexically_normal();
+    ec.clear();
+    std::filesystem::recursive_directory_iterator it(archiveRoot,std::filesystem::directory_options::skip_permission_denied,ec),end;
+    while(!ec&&it!=end){
+        const auto entry=*it;
+        it.increment(ec);
+        if(ec){ec.clear();continue;}
+        const std::string testId=entry.path().parent_path().parent_path().filename().string();
+        const std::string runStamp=entry.path().parent_path().parent_path().parent_path().filename().string();
+        std::error_code typeError;
+        if(entry.is_symlink(typeError)||typeError||!entry.is_regular_file(typeError)||typeError||entry.path().filename()!="test.log"
+            ||entry.path().parent_path().filename()!=accountDirectory||!evidenceArchiveId(testId)||!validArchiveRunStamp(runStamp))continue;
+        std::error_code absoluteError;
+        if(std::filesystem::absolute(entry.path(),absoluteError).lexically_normal()==currentAbsolute)continue;
+
+        std::error_code stateError;
+        const auto sizeBefore=std::filesystem::file_size(entry.path(),stateError);
+        if(stateError||sizeBefore>64ULL*1024ULL*1024ULL)continue;
+        const auto modifiedBefore=std::filesystem::last_write_time(entry.path(),stateError);
+        if(stateError)continue;
+        std::ifstream input(entry.path());
+        if(!input)continue;
+        std::vector<std::string> lines;
+        std::string line;
+        while(std::getline(input,line))lines.push_back(std::move(line));
+        const auto sizeAfter=std::filesystem::file_size(entry.path(),stateError);
+        if(stateError)continue;
+        const auto modifiedAfter=std::filesystem::last_write_time(entry.path(),stateError);
+        if(stateError||sizeBefore!=sizeAfter||modifiedBefore!=modifiedAfter)continue;
+        std::vector<std::string> session;
+        bool inspectedFile=false;
+        const auto inspectSession=[&](){
+            if(session.empty())return;
+            const auto sessionDate=archivedRecordDate(session.front());
+            if(sessionDate&&*sessionDate==businessDate){
+                inspectedFile=true;
+                analyzeArchivedSession(session,entry.path(),testId,account,modifiedAfter,scan);
+            }
+        };
+        for(const auto& record:lines){
+            if(record.find("[SYSTEM] YD API started;")!=std::string::npos){
+                inspectSession();
+                session.clear();
+            }
+            if(!session.empty()||record.find("[SYSTEM] YD API started;")!=std::string::npos)session.push_back(record);
+        }
+        inspectSession();
+        if(inspectedFile)++scan.filesScanned;
+    }
+    return scan;
+}
 
 std::string snapshotNumber(double value){
     if(!std::isfinite(value)||value==DBL_MAX||value==-DBL_MAX)return "N/A";
@@ -152,6 +494,15 @@ OrderActivitySnapshot activityDelta(const OrderActivitySnapshot& after,const Ord
     };
 }
 
+BatchCancelActivitySnapshot batchCancelActivityDelta(const BatchCancelActivitySnapshot& after,const BatchCancelActivitySnapshot& before){
+    return {
+        counterDelta(after.apiCalls,before.apiCalls),
+        counterDelta(after.apiCallsSubmitted,before.apiCallsSubmitted),
+        counterDelta(after.targetOrdersRequested,before.targetOrdersRequested),
+        counterDelta(after.targetOrdersSubmitted,before.targetOrdersSubmitted)
+    };
+}
+
 bool readySession(YdSession& s,TestResult& r,int t,const std::string& account){
     if(!s.start()){r.fail("API start");return false;}
     if(s.waitConnected(t))r.pass("TCP trade connected");else{r.fail("TCP trade connected","timeout");return false;}
@@ -163,23 +514,34 @@ bool readySession(YdSession& s,TestResult& r,int t,const std::string& account){
     return true;
 }
 
+bool readySessionObserved(YdSession& s,TestResult& r,int t,const std::string& account){
+    if(!s.start()){r.fail("API start");return false;}
+    if(!s.waitConnected(t)){r.fail("TCP trade connected","timeout");return false;}
+    if(!s.waitLogin(t)){r.fail("account login","account="+account+" timeout");return false;}
+    if(s.loginError()!=0){r.fail("account login","account="+account+" errorNo="+std::to_string(s.loginError()));return false;}
+    if(!s.waitInit(t)){r.fail("static data ready","notifyFinishInit timeout");return false;}
+    if(!s.waitCaughtUp(t)){r.fail("history caught up","notifyCaughtUp timeout");return false;}
+    r.observe("trading system session ready","account="+account+" loginTime="+timestampText());
+    return true;
+}
+
 bool marketFor(YdSession& s,const YDInstrument* i,int t,YDMarketData& md){return i&&s.subscribe(i)&&s.waitMarketData(i->InstrumentRef,t,md);}
 double legalPrice(double p,double tick){return tick>0?std::round(p/tick)*tick:p;}
 bool terminal(const YDOrder& o){return o.OrderStatus==YD_OS_Canceled||o.OrderStatus==YD_OS_AllTraded||o.OrderStatus==YD_OS_Rejected;}
 
 int closeOffset(const YDInstrument* i){return (i&&i->m_pExchange&&i->m_pExchange->UseTodayPosition)?YD_OF_CloseToday:YD_OF_Close;}
 
-int runEach(const RunOptions& o,const std::string& id,const std::function<void(const Account&,const Config&,Logger&,TestResult&)>& fn,bool stopAccountsOnFailure=false){
-    Env e=makeEnv(o);int rc=0;for(const auto& a:e.accounts){Logger log(accountLog(e,id,a));log.info("TEST",id+" account="+a.username);TestResult r(id,a.username,log);try{fn(a,e.cfg,log,r);}catch(const std::exception& ex){r.fail("unhandled exception",ex.what());}r.writeSummary(e.root/"summary.csv");const bool accountFailed=r.failed();rc=combine(rc,accountFailed?1:0);if(stopAccountsOnFailure&&accountFailed){log.error("ALERT","LIVE account sequence stopped after failure account="+a.username+"; no later accounts were started");break;}}std::cout<<"Output: "<<e.root.string()<<std::endl;return rc;
+int runEach(const RunOptions& o,const std::string& id,const std::function<void(const Account&,const Config&,Logger&,TestResult&)>& fn,bool stopAccountsOnFailure=false,bool systemMonitorPresentation=false){
+    Env e=makeEnv(o);int rc=0;for(const auto& a:e.accounts){Logger log(accountLog(e,id,a));if(systemMonitorPresentation)log.info("SYSTEM","trading risk-control system started account="+a.username);else log.info("TEST",id+" account="+a.username);TestResult r(id,a.username,log);try{fn(a,e.cfg,log,r);}catch(const std::exception& ex){r.fail("unhandled exception",ex.what());}r.writeSummary(e.root/"summary.csv");const bool accountFailed=r.failed();rc=combine(rc,accountFailed?1:0);if(stopAccountsOnFailure&&accountFailed){log.error("ALERT","LIVE account sequence stopped after failure account="+a.username+"; no later accounts were started");break;}}std::cout<<"Output: "<<e.root.string()<<std::endl;return rc;
 }
 }
 
-int runTest01Connect(const RunOptions& o){return runEach(o,"2.1_connect",[&](const Account&a,const Config&c,Logger&l,TestResult&r){YdSession s(o.ydConfig,a.username,a.password,l);readySession(s,r,timeout(c),a.username);});}
+int runTest01Connect(const RunOptions& o){return runEach(o,"2.1_connect",[&](const Account&a,const Config&c,Logger&l,TestResult&r){YdSession s(o.ydConfig,a.username,a.password,l,false,monitorThresholds(c));readySession(s,r,timeout(c),a.username);});}
 
 int runTest12MarketPosition(const RunOptions& o){return runEach(o,"1.2_market_position",[&](const Account&a,const Config&c,Logger&l,TestResult&r){
     l.info("SYSTEM","READ_ONLY snapshot test: no order or cancel API will be called");
     const int snapshotTimeout=c.getInt("Snapshot.TimeoutSeconds",120);
-    YdSession s(o.ydConfig,a.username,a.password,l,true);if(!readySession(s,r,snapshotTimeout,a.username))return;
+    YdSession s(o.ydConfig,a.username,a.password,l,true,monitorThresholds(c));if(!readySession(s,r,snapshotTimeout,a.username))return;
     auto* api=s.extendedApi();if(!api){r.fail("extended API available","required for read-only position query");return;}
 
     const YDAccount* ydAccount=api->getMyAccount();
@@ -248,13 +610,14 @@ int runTest12MarketPosition(const RunOptions& o){return runEach(o,"1.2_market_po
     else r.fail("market or position evidence","no market snapshot and no non-zero position; use an active --instrument");
 });}
 
-enum class LiveWorkflowMode { BasicTrade, OrderCancelCount };
+enum class LiveWorkflowMode { BasicTrade, OrderCancelCount, BatchCancel };
 
 int runLiveOrderWorkflow(const RunOptions& o,const std::string& testId,LiveWorkflowMode mode){
+const bool batchMode=mode==LiveWorkflowMode::BatchCancel;
 return runEach(o,testId,[&](const Account&a,const Config&c,Logger&l,TestResult&r){
     const bool countMode=mode==LiveWorkflowMode::OrderCancelCount;
     // This gate must remain before YdSession construction: without --live this test performs no order/cancel API call.
-    if(!o.live){r.skip(countMode?"live order/cancel monitoring":"live trading","rerun with --live in a broker-approved test environment");return;}
+    if(!o.live){r.skip(countMode?"live order/cancel monitoring":(batchMode?"live batch cancellation":"live trading"),"rerun with --live in a broker-approved test environment");return;}
 
     constexpr int requiredCount=2;
     constexpr int orderVolume=1;
@@ -262,15 +625,15 @@ return runEach(o,testId,[&](const Account&a,const Config&c,Logger&l,TestResult&r
     const int actionTimeout=std::max(1,c.getInt("Trade.ActionTimeoutSeconds",30));
     const int callbackQuietMilliseconds=std::max(1,c.getInt("Trade.CallbackQuietMilliseconds",2000));
     const int aggressiveTicks=std::max(0,c.getInt("Trade.AggressiveTicks",2));
-    const int workingOffsetTicks=std::max(1,c.getInt("Trade.WorkingOrderOffsetTicks",50));
+    const int workingOffsetTicks=std::max(1,c.getInt(batchMode?"BatchCancel.WorkingOrderOffsetTicks":"Trade.WorkingOrderOffsetTicks",c.getInt("Trade.WorkingOrderOffsetTicks",50)));
 
-    YdSession s(o.ydConfig,a.username,a.password,l,true);
-    if(!readySession(s,r,sessionTimeout,a.username))return;
+    YdSession s(o.ydConfig,a.username,a.password,l,true,monitorThresholds(c),o.live);
+    if(!(batchMode?readySessionObserved(s,r,sessionTimeout,a.username):readySession(s,r,sessionTimeout,a.username)))return;
     const std::string requestedInstrument=instID(o,c);
     const YDInstrument* instrument=s.instrument(requestedInstrument);
     if(!instrument){r.fail("instrument exists","instrument="+requestedInstrument);return;}
     const std::string instrumentId=instrument->InstrumentID;
-    r.pass("instrument exists","instrument="+instrumentId);
+    if(batchMode)r.observe("instrument available","instrument="+instrumentId);else r.pass("instrument exists","instrument="+instrumentId);
 
     const YDAccount* ydAccount=s.api()?s.api()->getMyAccount():nullptr;
     if(!ydAccount){r.fail("live trading preflight","getMyAccount returned null; no order sent");return;}
@@ -298,11 +661,14 @@ return runEach(o,testId,[&](const Account&a,const Config&c,Logger&l,TestResult&r
     if(!s.waitNextMarketData(instrument->InstrumentRef,marketVersion,sessionTimeout,initialMarket)){r.fail("live trading preflight","market data timeout account="+accountId+" instrument="+instrumentId+"; no order sent");return;}
     std::string marketReason;
     if(!usableMarket(instrument,initialMarket,marketReason)){r.fail("live trading preflight","account="+accountId+" instrument="+instrumentId+" reason="+marketReason+"; no order sent");return;}
-    r.pass("live trading preflight","account="+accountId+" instrument="+instrumentId+" bid="+snapshotNumber(initialMarket.BidPrice)+" ask="+snapshotNumber(initialMarket.AskPrice)+" volumePerOrder=1");
+    if(batchMode)r.observe("batch cancellation preflight","account="+accountId+" instrument="+instrumentId+" bid="+snapshotNumber(initialMarket.BidPrice)+" ask="+snapshotNumber(initialMarket.AskPrice)+" volumePerOrder=1");
+    else r.pass("live trading preflight","account="+accountId+" instrument="+instrumentId+" bid="+snapshotNumber(initialMarket.BidPrice)+" ask="+snapshotNumber(initialMarket.AskPrice)+" volumePerOrder=1");
     const OrderActivitySnapshot activityStart=s.orderActivity();
+    const BatchCancelActivitySnapshot batchActivityStart=s.batchCancelActivity();
     std::vector<LiveTicket> tickets;
     tickets.reserve(16);
-    int openCompleted=0,cancelCompleted=0,closeCompleted=0;
+    int openCompleted=0,cancelCompleted=0,closeCompleted=0,batchCancelCompleted=0;
+    bool batchCallSubmitted=false;
     std::string stepFailure;
     auto noteFailure=[&](const std::string& text){if(stepFailure.empty())stepFailure=text;l.error("ORDER_RESULT",text);};
     auto currentMarket=[&](YDMarketData& md,std::string& reason){
@@ -386,11 +752,89 @@ return runEach(o,testId,[&](const Account&a,const Config&c,Logger&l,TestResult&r
         logCancelResult(l,accountId,instrumentId,ticket,finalOrder);
         return true;
     };
+    std::vector<std::pair<const YDInstrument*,YDOrder>> batchWorkingOrders;
+    batchWorkingOrders.reserve(requiredCount);
+    auto prepareBatchCancelOrder=[&](int sequence){
+        YDMarketData md{};std::string reason;
+        if(!currentMarket(md,reason)){noteFailure("BATCH_CANCEL #"+std::to_string(sequence)+" market unavailable: "+reason);return false;}
+        double price=0;
+        const double requested=md.BidPrice-(workingOffsetTicks+sequence-1)*instrument->Tick;
+        if(!boundedLegalPrice(requested,instrument,md,price)){noteFailure("BATCH_CANCEL #"+std::to_string(sequence)+" cannot create legal passive price");return false;}
+        const double tolerance=instrument->Tick*1e-6;
+        if(price>=md.BidPrice-tolerance||price>=md.AskPrice-tolerance){
+            noteFailure("BATCH_CANCEL #"+std::to_string(sequence)+" passive price is not below current bid/ask; no order sent");return false;
+        }
+        LiveTicket ticket{"BATCH_CANCEL",sequence,0,YD_D_Buy,YD_OF_Open,price,orderVolume};
+        tickets.push_back(ticket);
+        ticket.orderRef=s.sendLimitOrder(instrument,ticket.direction,ticket.offset,ticket.orderPrice,ticket.volume);
+        if(ticket.orderRef<0){tickets.pop_back();noteFailure("BATCH_CANCEL #"+std::to_string(sequence)+" insertOrder returned false");return false;}
+        tickets.back().orderRef=ticket.orderRef;
+
+        YDOrder working{};
+        if(!s.waitOrder(ticket.orderRef,actionTimeout,[](const YDOrder& order){return order.OrderStatus==YD_OS_Queuing||terminal(order);},working)){
+            noteFailure("BATCH_CANCEL #"+std::to_string(sequence)+" working/terminal callback timeout ref="+std::to_string(ticket.orderRef));return false;
+        }
+        if(working.ErrorNo!=0||working.OrderStatus!=YD_OS_Queuing||working.TradeVolume!=0){
+            noteFailure("BATCH_CANCEL #"+std::to_string(sequence)+" did not remain wholly unfilled and cancelable ref="+std::to_string(ticket.orderRef)
+                +" status="+orderStatusName(working.OrderStatus)+" errorNo="+std::to_string(working.ErrorNo)
+                +" traded="+std::to_string(working.TradeVolume)+"/"+std::to_string(working.OrderVolume));return false;
+        }
+        if(working.LongOrderSysID==0&&working.OrderSysID==0){
+            noteFailure("BATCH_CANCEL #"+std::to_string(sequence)+" queued order has no system order ID ref="+std::to_string(ticket.orderRef));return false;
+        }
+        std::string mismatch;
+        if(!orderMatchesTicket(ticket,working,instrument->Tick,mismatch)){
+            noteFailure("BATCH_CANCEL #"+std::to_string(sequence)+" order callback mismatch ref="+std::to_string(ticket.orderRef)+" reason="+mismatch);return false;
+        }
+        batchWorkingOrders.push_back({instrument,working});
+        l.info("ORDER","account="+accountId+" event=BATCH_CANCEL_TARGET_READY sequence="+std::to_string(sequence)+"/2 instrument="+instrumentId
+            +" orderRef="+std::to_string(ticket.orderRef)+" orderSysId="+orderSystemId(working)+" status=QUEUING traded=0/"+std::to_string(ticket.volume));
+        return true;
+    };
 
     bool executionException=false;
     std::string executionExceptionDetail;
     try{
-        if(countMode){
+        if(batchMode){
+            stepFailure.clear();
+            for(int sequence=1;sequence<=requiredCount;++sequence){if(!prepareBatchCancelOrder(sequence))break;}
+            if(batchWorkingOrders.size()==requiredCount){
+                const OrderStreamSnapshot readySnapshot=s.orderStreamSnapshot();
+                for(std::size_t n=0;n<batchWorkingOrders.size();++n){
+                    const int orderRef=batchWorkingOrders[n].second.OrderRef;
+                    const auto latest=readySnapshot.orders.find(orderRef);
+                    if(latest==readySnapshot.orders.end()||latest->second.ErrorNo!=0||latest->second.OrderStatus!=YD_OS_Queuing||latest->second.TradeVolume!=0){
+                        noteFailure("BATCH_CANCEL target changed before batch request ref="+std::to_string(orderRef));
+                        batchWorkingOrders.clear();break;
+                    }
+                    batchWorkingOrders[n].second=latest->second;
+                }
+            }
+            if(batchWorkingOrders.size()==requiredCount){
+                batchCallSubmitted=s.cancelMulti(batchWorkingOrders);
+                if(!batchCallSubmitted)noteFailure("cancelMultiOrders returned false for targetCount=2");
+            }
+            if(batchCallSubmitted){
+                for(std::size_t n=0;n<batchWorkingOrders.size();++n){
+                    const LiveTicket& ticket=tickets[n];
+                    YDOrder finalOrder{};
+                    const int cancelResult=s.waitCancelTerminal(ticket.orderRef,actionTimeout,finalOrder);
+                    if(cancelResult<0){noteFailure("BATCH_CANCEL terminal callback timeout ref="+std::to_string(ticket.orderRef));continue;}
+                    if(cancelResult>0){noteFailure("BATCH_CANCEL failed-cancel callback ref="+std::to_string(ticket.orderRef)+" errorNo="+std::to_string(cancelResult));continue;}
+                    std::string mismatch;
+                    if(finalOrder.ErrorNo!=0||finalOrder.OrderStatus!=YD_OS_Canceled||finalOrder.TradeVolume!=0||finalOrder.OrderVolume!=ticket.volume){
+                        noteFailure("BATCH_CANCEL unexpected final state ref="+std::to_string(ticket.orderRef)+" status="+orderStatusName(finalOrder.OrderStatus)
+                            +" errorNo="+std::to_string(finalOrder.ErrorNo)+" traded="+std::to_string(finalOrder.TradeVolume)+"/"+std::to_string(finalOrder.OrderVolume));continue;
+                    }
+                    if(!orderMatchesTicket(ticket,finalOrder,instrument->Tick,mismatch)){
+                        noteFailure("BATCH_CANCEL final callback mismatch ref="+std::to_string(ticket.orderRef)+" reason="+mismatch);continue;
+                    }
+                    ++batchCancelCompleted;
+                    l.info("ORDER","account="+accountId+" event=BATCH_CANCEL_RESULT sequence="+std::to_string(n+1)+"/2 instrument="+instrumentId
+                        +" orderRef="+std::to_string(ticket.orderRef)+" orderSysId="+orderSystemId(finalOrder)+" status=CANCELED traded=0/"+std::to_string(ticket.volume));
+                }
+            }
+        }else if(countMode){
             stepFailure.clear();
             for(int sequence=1;sequence<=requiredCount;++sequence){if(!sendAndCancel(sequence))break;++cancelCompleted;}
             if(cancelCompleted==requiredCount)r.pass("monitored order cancellations","account="+accountId+" instrument="+instrumentId+" completed=2/2");
@@ -423,6 +867,8 @@ return runEach(o,testId,[&](const Account&a,const Config&c,Logger&l,TestResult&r
     }
     const OrderActivitySnapshot activityBeforeCleanup=s.orderActivity();
     const OrderActivitySnapshot measuredActivity=activityDelta(activityBeforeCleanup,activityStart);
+    const BatchCancelActivitySnapshot batchActivityBeforeCleanup=s.batchCancelActivity();
+    const BatchCancelActivitySnapshot measuredBatchActivity=batchCancelActivityDelta(batchActivityBeforeCleanup,batchActivityStart);
 
     // From the first successful insert onward, all exits converge here. Settle working orders first,
     // then derive this test's net exposure from final order and validated trade callbacks and flatten it.
@@ -545,7 +991,7 @@ return runEach(o,testId,[&](const Account&a,const Config&c,Logger&l,TestResult&r
             }
             const std::int64_t observedVolume=std::max<std::int64_t>(std::max(0,order->second.TradeVolume),std::max<std::int64_t>(0,callbackTradeVolume));
             observedTradeVolumes[ticket.orderRef]=observedVolume;
-            if(std::string(ticket.phase)=="CANCEL")unexpectedTradeVolume+=observedVolume;
+            if(std::string(ticket.phase)=="CANCEL"||std::string(ticket.phase)=="BATCH_CANCEL")unexpectedTradeVolume+=observedVolume;
         }
         netTestPosition=calculateNet(netKnown);
     };
@@ -597,6 +1043,9 @@ return runEach(o,testId,[&](const Account&a,const Config&c,Logger&l,TestResult&r
     const OrderActivitySnapshot activityEnd=finalSnapshot.activity;
     const OrderActivitySnapshot cleanupActivity=activityDelta(activityEnd,activityBeforeCleanup);
     const OrderActivitySnapshot totalActivity=activityDelta(activityEnd,activityStart);
+    const BatchCancelActivitySnapshot batchActivityEnd=s.batchCancelActivity();
+    const BatchCancelActivitySnapshot cleanupBatchActivity=batchCancelActivityDelta(batchActivityEnd,batchActivityBeforeCleanup);
+    const BatchCancelActivitySnapshot totalBatchActivity=batchCancelActivityDelta(batchActivityEnd,batchActivityStart);
     const bool measurementCountsMatch=measuredActivity.orderApiRequests==requiredCount
         &&measuredActivity.orderRequestsSubmitted==requiredCount
         &&measuredActivity.uniqueAcceptedOrders==requiredCount
@@ -618,10 +1067,24 @@ return runEach(o,testId,[&](const Account&a,const Config&c,Logger&l,TestResult&r
         &&totalActivity.confirmedCancellations==requiredCount
         &&totalActivity.failedCancelCallbacks==0
         &&totalActivity.callbackValidationFailures==0;
+    const bool measurementBatchCountsMatch=measuredBatchActivity.apiCalls==1
+        &&measuredBatchActivity.apiCallsSubmitted==1
+        &&measuredBatchActivity.targetOrdersRequested==requiredCount
+        &&measuredBatchActivity.targetOrdersSubmitted==requiredCount;
+    const bool totalBatchCountsStable=totalBatchActivity.apiCalls==1
+        &&totalBatchActivity.apiCallsSubmitted==1
+        &&totalBatchActivity.targetOrdersRequested==requiredCount
+        &&totalBatchActivity.targetOrdersSubmitted==requiredCount
+        &&cleanupBatchActivity.apiCalls==0
+        &&cleanupBatchActivity.targetOrdersRequested==0;
     const bool monitoringPass=countMode&&!executionException&&cancelCompleted==requiredCount&&measurementCountsMatch
         &&totalCountsStable&&callbackStreamQuiet&&streamStableThroughStop&&measurementTradeKnown&&tradeVolumeConsistent&&unexpectedTradeVolume==0&&cleanupRestored&&cleanupUsedNoTradeApi;
+    const bool batchCancelSucceeded=batchMode&&!executionException&&stepFailure.empty()&&batchCallSubmitted&&batchCancelCompleted==requiredCount
+        &&measurementCountsMatch&&measurementBatchCountsMatch&&totalCountsStable&&totalBatchCountsStable
+        &&callbackStreamQuiet&&streamStableThroughStop&&measurementTradeKnown&&tradeVolumeConsistent&&unexpectedTradeVolume==0&&cleanupRestored&&cleanupUsedNoTradeApi;
     if(cleanupRestored){
-        r.pass("live cleanup","account="+accountId+" instrument="+instrumentId+" noWorkingOrders=true ownedOrderNetPosition=0 baselineQuantityRestored=true");
+        if(batchMode)r.observe("batch cancellation cleanup","account="+accountId+" instrument="+instrumentId+" noWorkingOrders=true ownedOrderNetPosition=0 baselineQuantityRestored=true");
+        else r.pass("live cleanup","account="+accountId+" instrument="+instrumentId+" noWorkingOrders=true ownedOrderNetPosition=0 baselineQuantityRestored=true");
     }else{
         std::ostringstream detail;detail<<"MANUAL ACTION REQUIRED account="<<accountId<<" instrument="<<instrumentId
             <<" ownedOrderNetPosition="<<(netKnown?std::to_string(netTestPosition):std::string("UNKNOWN"))
@@ -660,8 +1123,42 @@ return runEach(o,testId,[&](const Account&a,const Config&c,Logger&l,TestResult&r
         if(monitoringPass)l.info("COUNT_RESULT",line.str());else l.error("COUNT_RESULT",line.str());
     }
 
+    if(batchMode){
+        std::ostringstream unresolved;
+        if(unresolvedRefs.empty())unresolved<<"none";else for(std::size_t n=0;n<unresolvedRefs.size();++n){if(n)unresolved<<',';unresolved<<unresolvedRefs[n];}
+        std::ostringstream line;line<<"account="<<accountId<<" event=BATCH_CANCEL_STATISTICS statisticsTime="<<timestampText()<<" instrument="<<instrumentId
+            <<" batchSize="<<requiredCount
+            <<" batchApiReturned="<<(batchCallSubmitted?"true":"false")
+            <<" batchApiCalls="<<measuredBatchActivity.apiCalls
+            <<" batchApiCallsSubmitted="<<measuredBatchActivity.apiCallsSubmitted
+            <<" batchTargetOrders="<<measuredBatchActivity.targetOrdersRequested
+            <<" batchTargetOrdersSubmitted="<<measuredBatchActivity.targetOrdersSubmitted
+            <<" orderApiRequests="<<measuredActivity.orderApiRequests
+            <<" orderRequestsSubmitted="<<measuredActivity.orderRequestsSubmitted
+            <<" uniqueAcceptedOrders="<<measuredActivity.uniqueAcceptedOrders
+            <<" cancelApiRequests="<<measuredActivity.cancelApiRequests
+            <<" cancelRequestsSubmitted="<<measuredActivity.cancelRequestsSubmitted
+            <<" confirmedCancellations="<<measuredActivity.confirmedCancellations
+            <<" canceledOrders="<<batchCancelCompleted
+            <<" failedCancelCallbacks="<<measuredActivity.failedCancelCallbacks
+            <<" callbackValidationFailures="<<measuredActivity.callbackValidationFailures
+            <<" unexpectedTradeVolume="<<(measurementTradeKnown?std::to_string(unexpectedTradeVolume):std::string("UNKNOWN"))
+            <<" tradeVolumeConsistent="<<(tradeVolumeConsistent?"true":"false")
+            <<" noWorkingOrders="<<(allSettled?"true":"false")
+            <<" ownedNetLong="<<(netKnown?std::to_string(netTestPosition):std::string("UNKNOWN"))
+            <<" positionRestored="<<(positionQueryAvailable?(positionRestored?"true":"false"):"UNKNOWN")
+            <<" callbackStreamQuiet="<<(callbackStreamQuiet?"true":"false")
+            <<" streamStableThroughStop="<<(streamStableThroughStop?"true":"false")
+            <<" cleanupRestored="<<(cleanupRestored?"true":"false")
+            <<" cleanupOrderApiRequests="<<cleanupActivity.orderApiRequests
+            <<" cleanupCancelApiRequests="<<cleanupActivity.cancelApiRequests
+            <<" unresolvedRefs="<<unresolved.str();
+        if(batchCancelSucceeded){l.info("BATCH_CANCEL",line.str());r.observe("batch cancellation snapshot",line.str());}
+        else{l.error("BATCH_CANCEL",line.str());r.fail("batch cancellation consistency",line.str()+(stepFailure.empty()?std::string():" reason="+stepFailure));}
+    }
+
     if(executionException){
-        r.fail(countMode?"order/cancel monitoring exception":"basic trading workflow exception","account="+accountId+" reason="+executionExceptionDetail+"; cleanup was attempted");
+        r.fail(countMode?"order/cancel monitoring exception":(batchMode?"batch cancellation exception":"basic trading workflow exception"),"account="+accountId+" reason="+executionExceptionDetail+"; cleanup was attempted");
     }else if(countMode){
         const std::string detail="account="+accountId+" instrument="+instrumentId
             +" orderApiRequests="+std::to_string(measuredActivity.orderApiRequests)
@@ -675,12 +1172,12 @@ return runEach(o,testId,[&](const Account&a,const Config&c,Logger&l,TestResult&r
             +" streamStableThroughStop="+(streamStableThroughStop?std::string("true"):std::string("false"));
         if(monitoringPass)r.pass("order/cancel count monitoring",detail);
         else r.fail("order/cancel count monitoring",detail);
-    }else if(openCompleted==requiredCount&&cancelCompleted==requiredCount&&closeCompleted==requiredCount
+    }else if(!batchMode&&openCompleted==requiredCount&&cancelCompleted==requiredCount&&closeCompleted==requiredCount
         &&callbackStreamQuiet&&streamStableThroughStop&&measurementTradeKnown&&tradeVolumeConsistent&&unexpectedTradeVolume==0
         &&totalActivity.failedCancelCallbacks==0&&totalActivity.callbackValidationFailures==0&&cleanupRestored){
         r.pass("basic trading workflow","account="+accountId+" instrument="+instrumentId+" openFills=2 cancellations=2 closeFills=2 ownedOrderNetPosition=0 baselineQuantityRestored=true");
-    }else r.fail("basic trading workflow","account="+accountId+" instrument="+instrumentId+" openFills="+std::to_string(openCompleted)+" cancellations="+std::to_string(cancelCompleted)+" closeFills="+std::to_string(closeCompleted)+" callbackStreamQuiet="+(callbackStreamQuiet?std::string("true"):std::string("false"))+" streamStableThroughStop="+(streamStableThroughStop?std::string("true"):std::string("false")));
-},true);
+    }else if(!batchMode)r.fail("basic trading workflow","account="+accountId+" instrument="+instrumentId+" openFills="+std::to_string(openCompleted)+" cancellations="+std::to_string(cancelCompleted)+" closeFills="+std::to_string(closeCompleted)+" callbackStreamQuiet="+(callbackStreamQuiet?std::string("true"):std::string("false"))+" streamStableThroughStop="+(streamStableThroughStop?std::string("true"):std::string("false")));
+},true,batchMode);
 }
 
 int runTest02BasicTrade(const RunOptions& o){return runLiveOrderWorkflow(o,"2.2_basic_trade",LiveWorkflowMode::BasicTrade);}
@@ -689,7 +1186,7 @@ int runTest03Reconnect(const RunOptions& o){return runEach(o,"2.3_reconnect",[&]
     const int sessionTimeout=std::max(1,c.getInt("Reconnect.SessionTimeoutSeconds",120));
     const int disconnectTimeout=std::max(1,c.getInt("Reconnect.DisconnectTimeoutSeconds",30));
     const int reconnectTimeout=std::max(1,c.getInt("Reconnect.ReconnectTimeoutSeconds",120));
-    YdSession s(o.ydConfig,a.username,a.password,l);if(!readySession(s,r,sessionTimeout,a.username))return;
+    YdSession s(o.ydConfig,a.username,a.password,l,false,monitorThresholds(c));if(!readySession(s,r,sessionTimeout,a.username))return;
     const YDAccount* ydAccount=s.api()?s.api()->getMyAccount():nullptr;
     const std::string accountId=ydAccount&&ydAccount->AccountID[0]?std::string(ydAccount->AccountID):a.username;
     const SessionEventGenerations baseline=s.eventGenerations();
@@ -738,26 +1235,635 @@ int runTest03Reconnect(const RunOptions& o){return runEach(o,"2.3_reconnect",[&]
 
 int runTest04OrderCancelCount(const RunOptions& o){return runLiveOrderWorkflow(o,"2.4_order_cancel_count",LiveWorkflowMode::OrderCancelCount);}
 
-int runTest05Duplicate(const RunOptions& o){return runEach(o,"2.5_duplicate",[&](const Account&,const Config&c,Logger&l,TestResult&r){Monitor m(l,999,999,2);OrderIntent open{instID(o,c),YD_D_Buy,YD_OF_Open,100.0,1,false};m.recordOrder(open);m.recordOrder(open);OrderIntent close{instID(o,c),YD_D_Sell,YD_OF_Close,100.0,1,false};m.recordOrder(close);m.recordOrder(close);OrderIntent can{instID(o,c),YD_D_Buy,YD_OF_Open,100.0,1,true};m.recordCancel(can);m.recordCancel(can);if(m.duplicateCount()==3)r.pass("duplicate open/close/cancel statistics","duplicates=3");else r.fail("duplicate statistics","actual="+std::to_string(m.duplicateCount()));});}
+int runTest05Duplicate(const RunOptions& o){return runEach(o,"2.5_duplicate",[&](const Account&a,const Config&c,Logger&l,TestResult&r){
+    const int repeatCount=std::max(2,c.getInt("Duplicate.RepeatCount",2));
+    const int volume=std::max(1,c.getInt("Duplicate.Volume",3));
+    const double price=c.getDouble("Duplicate.Price",500.0);
+    Monitor m(l,a.username);
+    OrderIntent open{instID(o,c),YD_D_Buy,YD_OF_Open,price,volume,false};
+    OrderIntent close{instID(o,c),YD_D_Sell,YD_OF_Close,price,volume,false};
+    OrderIntent cancel{instID(o,c),YD_D_Buy,YD_OF_Open,price,volume,true};
+    for(int n=0;n<repeatCount;++n)m.recordOrder(open);
+    for(int n=0;n<repeatCount;++n)m.recordOrder(close);
+    for(int n=0;n<repeatCount;++n)m.recordCancel(cancel);
+    m.logDuplicateStatistics();
 
-int runTest06Threshold(const RunOptions& o){return runEach(o,"2.6_threshold",[&](const Account&,const Config&c,Logger&l,TestResult&r){const int ot=c.getInt("Threshold.OrderCount",3),ct=c.getInt("Threshold.CancelCount",2),dt=c.getInt("Threshold.DuplicateCount",2);Monitor m(l,ot,ct,dt);OrderIntent x{instID(o,c),YD_D_Buy,YD_OF_Open,100.0,1,false};for(int n=0;n<ot;++n){auto y=x;y.price+=n;m.recordOrder(y);}for(int n=0;n<ct;++n){auto y=x;y.cancel=true;y.price+=n;m.recordCancel(y);}m.recordOrder(x);m.recordOrder(x);m.recordOrder(x);if(m.orderAlerted())r.pass("order threshold alert");else r.fail("order threshold alert");if(m.cancelAlerted())r.pass("cancel threshold alert");else r.fail("cancel threshold alert");if(m.duplicateAlerted())r.pass("duplicate threshold alert");else r.fail("duplicate threshold alert");});}
+    const DuplicateStatistics& stats=m.duplicateStatistics();
+    const int expectedDuplicates=repeatCount-1;
+    const std::string detail="account="+a.username+" instrument="+open.instrument
+        +" openInstructionCount="+std::to_string(stats.openInstructions)+" openDuplicateCount="+std::to_string(stats.duplicateOpenInstructions)
+        +" closeInstructionCount="+std::to_string(stats.closeInstructions)+" closeDuplicateCount="+std::to_string(stats.duplicateCloseInstructions)
+        +" cancelInstructionCount="+std::to_string(stats.cancelInstructions)+" cancelDuplicateCount="+std::to_string(stats.duplicateCancelInstructions);
+    r.observe("duplicate order monitoring snapshot",detail);
+    if(stats.openInstructions!=repeatCount||stats.closeInstructions!=repeatCount||stats.cancelInstructions!=repeatCount
+        ||stats.duplicateOpenInstructions!=expectedDuplicates||stats.duplicateCloseInstructions!=expectedDuplicates
+        ||stats.duplicateCancelInstructions!=expectedDuplicates||m.duplicateCount()!=expectedDuplicates*3){
+        r.fail("duplicate monitor internal consistency",detail);
+    }
+},false,true);}
 
-int runTest07InstructionCheck(const RunOptions& o){return runEach(o,"2.7_instruction_check",[&](const Account&a,const Config&c,Logger&l,TestResult&r){YdSession s(o.ydConfig,a.username,a.password,l);if(!readySession(s,r,timeout(c),a.username))return;OrderValidator v(l);auto badInst=v.instrument(s.api(),"THIS_CONTRACT_MUST_NOT_EXIST");if(!badInst.ok)r.pass("invalid instrument rejected locally",badInst.reason);else r.fail("invalid instrument rejected locally");const auto* i=s.instrument(instID(o,c));if(!i){r.fail("reference instrument exists");return;}double badPrice=i->Tick*1000.0+i->Tick*0.5;auto bp=v.limitPrice(i,badPrice);if(!bp.ok)r.pass("invalid minimum price tick rejected locally",bp.reason);else r.fail("invalid minimum price tick rejected locally");auto bv=v.limitVolume(i,i->MaxLimitOrderVolume+std::max(1,i->MinLimitOrderVolume));if(!bv.ok)r.pass("over max single-order volume rejected locally",bv.reason);else r.fail("over max single-order volume rejected locally");});}
+int runTest06Threshold(const RunOptions& o){return runEach(o,"2.6_threshold",[&](const Account&a,const Config&c,Logger&l,TestResult&r){
+    const MonitorThresholds thresholds=monitorThresholds(c);
+    const std::string configuration="account="+a.username
+        +" orderCountThreshold="+std::to_string(thresholds.orderCount)
+        +" cancelCountThreshold="+std::to_string(thresholds.cancelCount)
+        +" duplicateCountThreshold="+std::to_string(thresholds.duplicateCount);
+    if(thresholds.orderCount<=0||thresholds.cancelCount<=0||thresholds.duplicateCount<=0){r.fail("risk threshold configuration",configuration+"; all thresholds must be positive for this run");return;}
 
-int runTest08ErrorMessage(const RunOptions& o){return runEach(o,"2.8_error_message",[&](const Account&a,const Config&c,Logger&l,TestResult&r){if(!o.live){r.skip("live rejected-order test","requires --live; choose --case no-position|insufficient-funds|market-state");return;}YdSession s(o.ydConfig,a.username,a.password,l);if(!readySession(s,r,timeout(c),a.username))return;const auto* i=s.instrument(instID(o,c));if(!i){r.fail("instrument exists");return;}YDMarketData md{};if(!marketFor(s,i,timeout(c),md)){r.fail("market data");return;}const std::string cs=o.caseName.empty()?"no-position":o.caseName;int dir=YD_D_Sell,off=closeOffset(i),vol=1;double price=legalPrice(md.BidPrice-i->Tick,i->Tick);std::set<int> expected;
-        if(cs=="no-position"){expected={YD_ERROR_NoPositionToClose};}
-        else if(cs=="insufficient-funds"){dir=YD_D_Buy;off=YD_OF_Open;vol=c.getInt("ErrorTest.InsufficientFundsVolume",std::max(1,i->MaxLimitOrderVolume));price=legalPrice(md.AskPrice+i->Tick,i->Tick);expected={YD_ERROR_NoMoneyToOpen};}
-        else if(cs=="market-state"){dir=YD_D_Buy;off=YD_OF_Open;expected={YD_ERROR_InstrumentTradingPaused,YD_ERROR_SSEATPGatewayNoTradingTime};}
-        else {r.fail("known --case","use no-position|insufficient-funds|market-state");return;}
-        int ref=s.sendLimitOrder(i,dir,off,price,vol);if(ref<0){r.fail("error test submit","insertOrder returned false before callback");return;}YDOrder ro{};if(!s.waitOrder(ref,timeout(c),[](const YDOrder&x){return x.ErrorNo!=0||x.OrderStatus==YD_OS_Rejected;},ro)){r.fail("error callback received","environment did not create requested rejection");return;}if(expected.count(ro.ErrorNo))r.pass("expected error displayed","case="+cs+" errorNo="+std::to_string(ro.ErrorNo));else r.fail("expected error displayed","case="+cs+" actual errorNo="+std::to_string(ro.ErrorNo));},true);}
+    Monitor m(l,a.username,thresholds);
+    OrderIntent instruction{instID(o,c),YD_D_Buy,YD_OF_Open,100.0,1,false};
+    for(int n=0;n<thresholds.orderCount;++n){auto unique=instruction;unique.price+=n;m.recordOrder(unique);}
+    for(int n=0;n<thresholds.cancelCount;++n){auto unique=instruction;unique.cancel=true;unique.price+=n;m.recordCancel(unique);}
+    for(int n=0;n<thresholds.duplicateCount;++n)m.recordOrder(instruction);
+    m.logRiskStatistics();
 
-int runTest09PauseTrade(const RunOptions& o){return runEach(o,"2.9_pause_trade",[&](const Account&,const Config&,Logger&l,TestResult&r){TradingGate g;if(g.canTrade())r.pass("trading initially enabled");else r.fail("trading initially enabled");g.pause();if(!g.canTrade()){l.warn("RISK","order blocked because trading is paused");r.pass("pause blocks trading instructions");}else r.fail("pause blocks trading instructions");g.resume();if(g.canTrade())r.pass("resume re-enables trading");else r.fail("resume re-enables trading");});}
+    const std::string statistics=configuration
+        +" orderCount="+std::to_string(m.orderCount())
+        +" cancelCount="+std::to_string(m.cancelCount())
+        +" duplicateCount="+std::to_string(m.duplicateCount())
+        +" orderAlerted="+(m.orderAlerted()?std::string("true"):std::string("false"))
+        +" cancelAlerted="+(m.cancelAlerted()?std::string("true"):std::string("false"))
+        +" duplicateAlerted="+(m.duplicateAlerted()?std::string("true"):std::string("false"));
+    r.observe("risk threshold monitoring snapshot",statistics);
+    if(!m.orderAlerted()||!m.cancelAlerted()||!m.duplicateAlerted())r.fail("risk threshold monitor internal consistency",statistics);
+},false,true);}
 
-int runTest10BatchCancel(const RunOptions& o){return runEach(o,"2.10_batch_cancel",[&](const Account&a,const Config&c,Logger&l,TestResult&r){if(!o.live){r.skip("batch cancel live test","rerun with --live");return;}YdSession s(o.ydConfig,a.username,a.password,l);if(!readySession(s,r,timeout(c),a.username))return;const auto* i=s.instrument(instID(o,c));if(!i){r.fail("instrument exists");return;}YDMarketData md{};if(!marketFor(s,i,timeout(c),md)){r.fail("market data");return;}const int far=c.getInt("Trade.WorkingOrderOffsetTicks",50);std::vector<std::pair<const YDInstrument*,YDOrder>> working;for(int n=0;n<2;++n){double p=legalPrice(md.BidPrice-(far+n)*i->Tick,i->Tick);int ref=s.sendLimitOrder(i,YD_D_Buy,YD_OF_Open,p,1);YDOrder w{};if(ref<0||!s.waitOrder(ref,timeout(c),[](const YDOrder&x){return x.OrderStatus==YD_OS_Queuing;},w)){r.fail("prepare working order "+std::to_string(n+1));return;}working.push_back({i,w});}r.pass("prepare multiple working orders","count=2");if(!s.cancelMulti(working)){r.fail("cancelMultiOrders submit");return;}bool all=true;for(auto& x:working){YDOrder f{};if(!s.waitOrder(x.second.OrderRef,timeout(c),[](const YDOrder&o){return o.OrderStatus==YD_OS_Canceled;},f))all=false;}if(all)r.pass("batch cancel completed");else r.fail("batch cancel completed");},true);}
+namespace {
+enum class InstructionCheckMode { All, InvalidInstrument, InvalidPrice, InvalidVolume };
 
-int runTest11Logging(const RunOptions& o){return runEach(o,"2.11_logging",[&](const Account&a,const Config&c,Logger&l,TestResult&r){l.info("SYSTEM","system runtime record example");l.info("MONITOR","monitor record example orderCount=1 cancelCount=0");l.error("ERROR","error-prompt record example");l.info("TRADE","trade/order record example instrument="+instID(o,c)+" volume=1");r.pass("system runtime log written",l.file().string());r.pass("monitoring log written");r.pass("error log written");r.pass("trade information log written");
-        // Also verify real connection logging when credentials are available.
-        YdSession s(o.ydConfig,a.username,a.password,l);if(s.start()&&s.waitConnected(timeout(c)))r.pass("YD connection event recorded");else r.fail("YD connection event recorded");});}
+int runInstructionCheck(const RunOptions& o,const std::string& id,InstructionCheckMode mode){return runEach(o,id,[&](const Account&a,const Config&c,Logger&l,TestResult&r){
+    YdSession s(o.ydConfig,a.username,a.password,l,false,monitorThresholds(c),false);
+    if(!readySessionObserved(s,r,timeout(c),a.username))return;
+    const bool checkInstrument=mode==InstructionCheckMode::All||mode==InstructionCheckMode::InvalidInstrument;
+    const bool checkPrice=mode==InstructionCheckMode::All||mode==InstructionCheckMode::InvalidPrice;
+    const bool checkVolume=mode==InstructionCheckMode::All||mode==InstructionCheckMode::InvalidVolume;
+    const std::string modeName=mode==InstructionCheckMode::All?"ALL":(mode==InstructionCheckMode::InvalidInstrument?"INVALID_INSTRUMENT":(mode==InstructionCheckMode::InvalidPrice?"INVALID_PRICE":"INVALID_VOLUME"));
+    const std::string invalidInstrumentId=checkInstrument?(o.instrument.empty()?c.get("Validation.InvalidInstrument","au2617"):o.instrument):std::string();
+    const std::string referenceInstrumentId=(checkPrice||checkVolume)?((!o.instrument.empty()&&mode!=InstructionCheckMode::All)?o.instrument:c.get("Validation.ReferenceInstrument",c.get("Test.Instrument","au2612"))):std::string();
+
+    if(checkInstrument){
+        if(invalidInstrumentId.empty()){r.fail("invalid instrument precondition","configure Validation.InvalidInstrument or pass --instrument");return;}
+        if(s.instrument(invalidInstrumentId)){r.fail("invalid instrument precondition","instrument="+invalidInstrumentId+" exists at the counter; choose a nonexistent contract code");return;}
+    }
+    const YDInstrument* instrument=nullptr;
+    if(checkPrice||checkVolume){
+        instrument=s.instrument(referenceInstrumentId);
+        if(!instrument){r.fail("reference instrument exists","instrument="+referenceInstrumentId+"; use an existing contract");return;}
+        if(instrument->Tick<=0){r.fail("reference instrument tick","instrument="+referenceInstrumentId+" tick must be positive");return;}
+    }
+    if(checkVolume&&instrument->MaxLimitOrderVolume>=INT_MAX){r.fail("construct over-limit volume","instrument maximum is INT_MAX");return;}
+
+    const int repeatCount=std::max(1,c.getInt("Validation.RepeatCount",3));
+    const int validVolume=instrument?std::max(1,instrument->MinLimitOrderVolume):1;
+    if(instrument&&validVolume>instrument->MaxLimitOrderVolume){r.fail("reference instrument volume","no valid limit-order volume");return;}
+    const double validPrice=instrument?instrument->Tick*1000.0:1.0;
+    const double badPrice=instrument?validPrice+instrument->Tick*0.5:0.0;
+    const int badVolume=instrument?instrument->MaxLimitOrderVolume+1:0;
+    const OrderActivitySnapshot activityBefore=s.orderActivity();
+    const InstructionValidationSnapshot validationBefore=s.instructionValidation();
+    bool allReturnedRejected=true;
+
+    if(checkInstrument)for(int n=0;n<repeatCount;++n)allReturnedRejected=s.sendLimitOrder(invalidInstrumentId,YD_D_Buy,YD_OF_Open,validPrice,validVolume)<0&&allReturnedRejected;
+    if(checkPrice)for(int n=0;n<repeatCount;++n)allReturnedRejected=s.sendLimitOrder(instrument,YD_D_Buy,YD_OF_Open,badPrice,validVolume)<0&&allReturnedRejected;
+    if(checkVolume)for(int n=0;n<repeatCount;++n)allReturnedRejected=s.sendLimitOrder(instrument,YD_D_Buy,YD_OF_Open,validPrice,badVolume)<0&&allReturnedRejected;
+
+    const OrderActivitySnapshot activityAfter=s.orderActivity();
+    const InstructionValidationSnapshot validationAfter=s.instructionValidation();
+    const std::uint64_t instrumentRejected=validationAfter.invalidInstrument-validationBefore.invalidInstrument;
+    const std::uint64_t priceRejected=validationAfter.invalidLimitPrice-validationBefore.invalidLimitPrice;
+    const std::uint64_t volumeRejected=validationAfter.invalidLimitVolume-validationBefore.invalidLimitVolume;
+    const std::uint64_t expectedInstrument=checkInstrument?static_cast<std::uint64_t>(repeatCount):0;
+    const std::uint64_t expectedPrice=checkPrice?static_cast<std::uint64_t>(repeatCount):0;
+    const std::uint64_t expectedVolume=checkVolume?static_cast<std::uint64_t>(repeatCount):0;
+    const std::uint64_t apiCalls=activityAfter.orderApiRequests-activityBefore.orderApiRequests;
+    const std::uint64_t apiSubmissions=activityAfter.orderRequestsSubmitted-activityBefore.orderRequestsSubmitted;
+    const std::string statistics="account="+a.username+" event=INSTRUCTION_CHECK_STATISTICS testPoint="+modeName
+        +" invalidInstrument="+(invalidInstrumentId.empty()?std::string("N/A"):invalidInstrumentId)
+        +" referenceInstrument="+(referenceInstrumentId.empty()?std::string("N/A"):referenceInstrumentId)
+        +" repeatCount="+std::to_string(repeatCount)
+        +" invalidInstrumentRejected="+std::to_string(instrumentRejected)
+        +" invalidPriceRejected="+std::to_string(priceRejected)
+        +" invalidVolumeRejected="+std::to_string(volumeRejected)
+        +" orderApiRequests="+std::to_string(apiCalls)
+        +" orderRequestsSubmitted="+std::to_string(apiSubmissions)
+        +" apiCalled="+(apiCalls==0?std::string("false"):std::string("true"));
+    l.info("VALIDATION",statistics);
+    r.observe("trading instruction validation snapshot",statistics);
+    if(!allReturnedRejected||instrumentRejected!=expectedInstrument||priceRejected!=expectedPrice||volumeRejected!=expectedVolume
+        ||apiCalls!=0||apiSubmissions!=0)r.fail("trading instruction validation consistency",statistics);
+},false,true);}
+}
+
+int runTest071InvalidInstrument(const RunOptions& o){return runInstructionCheck(o,"2.7.1_invalid_instrument",InstructionCheckMode::InvalidInstrument);}
+int runTest072InvalidPrice(const RunOptions& o){return runInstructionCheck(o,"2.7.2_invalid_price",InstructionCheckMode::InvalidPrice);}
+int runTest073InvalidVolume(const RunOptions& o){return runInstructionCheck(o,"2.7.3_invalid_volume",InstructionCheckMode::InvalidVolume);}
+int runTest07InstructionCheck(const RunOptions& o){return runInstructionCheck(o,"2.7_instruction_check",InstructionCheckMode::All);}
+
+namespace {
+enum class ErrorMessageMode { InsufficientFunds, NoPosition, MarketState };
+
+const char* ydErrorName(int errorNo){
+    switch(errorNo){
+        case YD_ERROR_NoError:return "NO_ERROR";
+        case YD_ERROR_NoPositionToClose:return "NO_POSITION_TO_CLOSE";
+        case YD_ERROR_NoMoneyToOpen:return "NO_MONEY_TO_OPEN";
+        case YD_ERROR_InstrumentCanNotTrade:return "INSTRUMENT_CANNOT_TRADE";
+        case YD_ERROR_NotProperTime:return "NOT_PROPER_TIME";
+        case YD_ERROR_InstrumentTradingPaused:return "INSTRUMENT_TRADING_PAUSED";
+        case YD_ERROR_CannotTradeInCurrentSegment:return "CANNOT_TRADE_IN_CURRENT_SEGMENT";
+        case YD_ERROR_SSEATPGatewayNoTradingTime:return "NO_TRADING_TIME";
+        default:return "UNCLASSIFIED_YD_ERROR";
+    }
+}
+
+std::set<int> expectedErrorNumbers(ErrorMessageMode mode){
+    if(mode==ErrorMessageMode::InsufficientFunds)return {YD_ERROR_NoMoneyToOpen};
+    if(mode==ErrorMessageMode::NoPosition)return {YD_ERROR_NoPositionToClose};
+    return {YD_ERROR_InstrumentCanNotTrade,YD_ERROR_NotProperTime,YD_ERROR_InstrumentTradingPaused,YD_ERROR_CannotTradeInCurrentSegment,YD_ERROR_SSEATPGatewayNoTradingTime};
+}
+
+struct OwnedOrderSettleResult {
+    bool callbackObserved=false;
+    bool settled=false;
+    YDOrder finalOrder{};
+};
+
+bool orderHasTerminalEvidence(const YDOrder& order){return order.ErrorNo!=0||terminal(order);}
+
+OwnedOrderSettleResult settleOwnedOrder(YdSession& session,const YDInstrument* instrument,int orderRef,int actionTimeout,Logger& log,const std::string& purpose){
+    OwnedOrderSettleResult result;
+    YDOrder state{};
+    if(!session.waitOrder(orderRef,actionTimeout,[](const YDOrder& order){return order.ErrorNo!=0||order.OrderStatus==YD_OS_Queuing||terminal(order);},state)){
+        log.error("CLEANUP","order state unavailable context="+purpose+" orderRef="+std::to_string(orderRef));
+        return result;
+    }
+    result.callbackObserved=true;result.finalOrder=state;
+    if(orderHasTerminalEvidence(state)){result.settled=true;return result;}
+    if(state.OrderStatus!=YD_OS_Queuing||((state.LongOrderSysID==0)&&(state.OrderSysID==0))){
+        log.error("CLEANUP","working order cannot be canceled context="+purpose+" orderRef="+std::to_string(orderRef)+" status="+orderStatusName(state.OrderStatus));
+        return result;
+    }
+    log.warn("CLEANUP","canceling working order during account-state reconciliation context="+purpose+" orderRef="+std::to_string(orderRef));
+    if(!session.cancelOrder(instrument,state)){
+        log.error("CLEANUP","cancelOrder returned false context="+purpose+" orderRef="+std::to_string(orderRef));
+        return result;
+    }
+    YDOrder finalOrder{};
+    const int cancelResult=session.waitCancelTerminal(orderRef,actionTimeout,finalOrder);
+    if(cancelResult!=0){
+        log.error("CLEANUP","cancel did not reach terminal state context="+purpose+" orderRef="+std::to_string(orderRef)+" result="+std::to_string(cancelResult));
+        return result;
+    }
+    result.finalOrder=finalOrder;result.settled=orderHasTerminalEvidence(finalOrder);return result;
+}
+
+OwnedOrderSettleResult waitCleanupClose(YdSession& session,const YDInstrument* instrument,int orderRef,int actionTimeout,Logger& log){
+    OwnedOrderSettleResult result;YDOrder state{};
+    if(session.waitOrder(orderRef,actionTimeout,[](const YDOrder& order){return orderHasTerminalEvidence(order);},state)){
+        result.callbackObserved=true;result.settled=true;result.finalOrder=state;return result;
+    }
+    log.warn("CLEANUP","position-restoring close did not finish before timeout orderRef="+std::to_string(orderRef));
+    return settleOwnedOrder(session,instrument,orderRef,actionTimeout,log,"POSITION_RESTORE");
+}
+
+bool ownedNetLong(const OrderStreamSnapshot& snapshot,const std::vector<LiveTicket>& tickets,int& netLong){
+    netLong=0;
+    for(const LiveTicket& ticket:tickets){
+        const auto order=snapshot.orders.find(ticket.orderRef);if(order==snapshot.orders.end())return false;
+        const auto trade=snapshot.tradeVolumeByOrderRef.find(ticket.orderRef);
+        const std::int64_t callbackVolume=trade==snapshot.tradeVolumeByOrderRef.end()?0:trade->second;
+        if(order->second.TradeVolume<0||callbackVolume<0)return false;
+        const std::int64_t observed=std::max<std::int64_t>(order->second.TradeVolume,callbackVolume);
+        if(observed>ticket.volume||observed>INT_MAX)return false;
+        if(ticket.direction==YD_D_Buy&&ticket.offset==YD_OF_Open)netLong+=static_cast<int>(observed);
+        else if(ticket.direction==YD_D_Sell&&ticket.offset!=YD_OF_Open)netLong-=static_cast<int>(observed);
+    }
+    return true;
+}
+
+bool allOwnedOrdersSettled(const OrderStreamSnapshot& snapshot,const std::vector<LiveTicket>& tickets){
+    for(const LiveTicket& ticket:tickets){const auto order=snapshot.orders.find(ticket.orderRef);if(order==snapshot.orders.end()||!orderHasTerminalEvidence(order->second))return false;}return true;
+}
+
+bool sameLongPosition(const LongPositionSnapshot& before,const LongPositionSnapshot& after,const YDInstrument* instrument){
+    return instrument&&instrument->m_pExchange&&instrument->m_pExchange->UseTodayPosition
+        ? before.today==after.today&&before.history==after.history&&before.other==after.other
+        : before.total()==after.total();
+}
+
+bool cleanupClosePrice(const YDInstrument* instrument,const YDMarketData& market,double& price){
+    if(!instrument)return false;
+    const double requested=usablePrice(market.LowerLimitPrice)?market.LowerLimitPrice:market.BidPrice-instrument->Tick*2.0;
+    return boundedLegalPrice(requested,instrument,market,price);
+}
+
+ErrorMessageMode configuredErrorMode(const RunOptions& options,bool& known){
+    known=true;
+    if(options.caseName.empty()||options.caseName=="no-position")return ErrorMessageMode::NoPosition;
+    if(options.caseName=="insufficient-funds")return ErrorMessageMode::InsufficientFunds;
+    if(options.caseName=="market-state")return ErrorMessageMode::MarketState;
+    known=false;return ErrorMessageMode::NoPosition;
+}
+
+int runErrorMessageCase(const RunOptions& o,const std::string& id,ErrorMessageMode mode){return runEach(o,id,[&](const Account&a,const Config&c,Logger&l,TestResult&r){
+    // This gate must remain before YdSession construction: without --live no order/cancel API can be called.
+    if(!o.live){r.skip("live exchange-error monitoring","requires --live in a broker-approved test environment");return;}
+    const int sessionTimeout=std::max(1,c.getInt("Trade.SessionTimeoutSeconds",120));
+    const int actionTimeout=std::max(1,c.getInt("ErrorTest.ActionTimeoutSeconds",c.getInt("Trade.ActionTimeoutSeconds",30)));
+    const int callbackQuietMilliseconds=std::max(1,c.getInt("Trade.CallbackQuietMilliseconds",2000));
+    const int passiveOffsetTicks=std::max(1,c.getInt("ErrorTest.PassiveOffsetTicks",50));
+    const int maxRestoreAttempts=std::max(1,c.getInt("ErrorTest.MaxRestoreAttempts",3));
+    const std::set<int> expected=expectedErrorNumbers(mode);
+
+    YdSession s(o.ydConfig,a.username,a.password,l,true,monitorThresholds(c),o.live);
+    if(!readySessionObserved(s,r,sessionTimeout,a.username))return;
+    const std::string requestedInstrument=instID(o,c);
+    const YDInstrument* instrument=s.instrument(requestedInstrument);
+    if(!instrument){r.fail("error-message preflight","instrument="+requestedInstrument+" does not exist; no order sent");return;}
+    const YDAccount* ydAccount=s.api()?s.api()->getMyAccount():nullptr;
+    if(!ydAccount){r.fail("error-message preflight","account unavailable; no order sent");return;}
+    const std::string accountId=ydAccount->AccountID[0]?std::string(ydAccount->AccountID):a.username;
+    const YDAccountInstrumentInfo* accountInstrument=s.api()->getAccountInstrumentInfo(instrument);
+    if(ydAccount->TradingRight!=YD_TR_Allow||!accountInstrument||accountInstrument->TradingRight!=YD_TR_Allow){
+        r.fail("error-message preflight","account/instrument trading right is not ALLOW; no order sent");return;
+    }
+    LongPositionSnapshot baselinePosition;
+    if(!queryLongSpeculationPosition(s.extendedApi(),ydAccount,instrument,baselinePosition)){
+        r.fail("error-message preflight","cannot query baseline long position; no order sent");return;
+    }
+    l.info("POSITION","account="+accountId+" event=POSITION_SNAPSHOT instrument="+requestedInstrument+" direction=LONG hedge=SPECULATION today="+std::to_string(baselinePosition.today)+" history="+std::to_string(baselinePosition.history)+" total="+std::to_string(baselinePosition.total()));
+    if(baselinePosition.total()!=0){
+        r.fail("error-message preflight","instrument has existing long speculation position="+std::to_string(baselinePosition.total())+"; choose a zero-position contract; no order sent");return;
+    }
+    if(!usablePrice(instrument->Tick)||instrument->MinLimitOrderVolume<1||instrument->MaxLimitOrderVolume<instrument->MinLimitOrderVolume){
+        r.fail("error-message preflight","invalid instrument tick or limit-order volume range; no order sent");return;
+    }
+
+    const int direction=mode==ErrorMessageMode::NoPosition?YD_D_Sell:YD_D_Buy;
+    const int offset=mode==ErrorMessageMode::NoPosition?closeOffset(instrument):YD_OF_Open;
+    const int volume=mode==ErrorMessageMode::InsufficientFunds?c.getInt("ErrorTest.InsufficientFundsVolume",instrument->MaxLimitOrderVolume):instrument->MinLimitOrderVolume;
+    if(volume<instrument->MinLimitOrderVolume||volume>instrument->MaxLimitOrderVolume){
+        r.fail("error-message preflight","configured volume="+std::to_string(volume)+" allowed=["+std::to_string(instrument->MinLimitOrderVolume)+","+std::to_string(instrument->MaxLimitOrderVolume)+"]; no order sent");return;
+    }
+
+    YDMarketData market{};const bool marketAvailable=s.subscribe(instrument)&&s.waitMarketData(instrument->InstrumentRef,actionTimeout,market);
+    const double configuredPrice=c.getDouble("ErrorTest.OrderPrice",0.0);
+    double price=0;
+    if(configuredPrice>0){
+        const double legalConfigured=legalPrice(configuredPrice,instrument->Tick);
+        if(marketAvailable){if(!boundedLegalPrice(legalConfigured,instrument,market,price)){r.fail("error-message preflight","configured price cannot be made legal; no order sent");return;}}
+        else price=legalConfigured;
+    }else{
+        if(!marketAvailable||!usablePrice(market.BidPrice)||!usablePrice(market.AskPrice)){
+            r.fail("error-message preflight","market price unavailable; set ErrorTest.OrderPrice to a legal price before an after-hours run; no order sent");return;
+        }
+        const double requested=direction==YD_D_Buy?market.BidPrice-passiveOffsetTicks*instrument->Tick:market.AskPrice+passiveOffsetTicks*instrument->Tick;
+        if(!boundedLegalPrice(requested,instrument,market,price)){
+            r.fail("error-message preflight","cannot construct a legal passive limit price; no order sent");return;
+        }
+        const double tolerance=instrument->Tick*1e-6;
+        if((direction==YD_D_Buy&&price>=market.AskPrice-tolerance)||(direction==YD_D_Sell&&price<=market.BidPrice+tolerance)){
+            r.fail("error-message preflight","constructed order is not passive; no order sent");return;
+        }
+    }
+    if(!usablePrice(price)){
+        r.fail("error-message preflight","configured/constructed order price is not positive; no order sent");return;
+    }
+
+    l.info("SYSTEM","account="+accountId+" component=ORDER_ERROR_MONITOR state=ACTIVE instrument="+requestedInstrument);
+    r.observe("order error monitor active","account="+accountId+" instrument="+requestedInstrument);
+
+    const OrderActivitySnapshot activityBefore=s.orderActivity();
+    std::vector<LiveTicket> tickets;tickets.reserve(static_cast<std::size_t>(maxRestoreAttempts)+1);
+    const int triggerRef=s.sendLimitOrder(instrument,direction,offset,price,volume);
+    if(triggerRef<0){r.fail("exchange-error callback","insertOrder was not submitted; no cabinet notifyOrder error was received");return;}
+    tickets.push_back({"ORDER_REQUEST",1,triggerRef,direction,offset,price,volume});
+    const OwnedOrderSettleResult trigger=settleOwnedOrder(s,instrument,triggerRef,actionTimeout,l,"ORDER_REQUEST");
+    const int actualErrorNo=trigger.callbackObserved?trigger.finalOrder.ErrorNo:0;
+    const bool errorCallbackReceived=trigger.callbackObserved&&actualErrorNo!=0;
+    const bool expectedErrorReceived=errorCallbackReceived&&expected.count(actualErrorNo)>0;
+    bool restoreBlocked=false;
+    for(int attempt=1;attempt<=maxRestoreAttempts;++attempt){
+        OrderStreamSnapshot snapshot;
+        s.waitOrderActivityQuiet(callbackQuietMilliseconds,actionTimeout,snapshot);
+        int netLong=0;
+        if(!ownedNetLong(snapshot,tickets,netLong)){l.error("CLEANUP","cannot calculate owned net position from callbacks");restoreBlocked=true;break;}
+        LongPositionSnapshot currentPosition;
+        if(!queryLongSpeculationPosition(s.extendedApi(),ydAccount,instrument,currentPosition)){l.error("CLEANUP","cannot query current long position");restoreBlocked=true;break;}
+        if(netLong==0)break;
+        if(netLong<0||currentPosition.total()<baselinePosition.total()+netLong){
+            l.error("CLEANUP","owned callback volume and account position are inconsistent ownedNetLong="+std::to_string(netLong)+" accountLong="+std::to_string(currentPosition.total()));restoreBlocked=true;break;
+        }
+        YDMarketData cleanupMarket{};
+        if(!s.waitMarketData(instrument->InstrumentRef,actionTimeout,cleanupMarket)){
+            l.error("CLEANUP","market data unavailable for position restore");restoreBlocked=true;break;
+        }
+        double closePrice=0;
+        if(!cleanupClosePrice(instrument,cleanupMarket,closePrice)){
+            l.error("CLEANUP","cannot construct legal position-restoring close price");restoreBlocked=true;break;
+        }
+        const int closeVolume=std::min(netLong,instrument->MaxLimitOrderVolume);
+        if(closeVolume<instrument->MinLimitOrderVolume){l.error("CLEANUP","residual position is below minimum close volume");restoreBlocked=true;break;}
+        const int closeRef=s.sendLimitOrder(instrument,YD_D_Sell,closeOffset(instrument),closePrice,closeVolume);
+        if(closeRef<0){l.error("CLEANUP","position-restoring close was not submitted");restoreBlocked=true;break;}
+        tickets.push_back({"RESIDUAL_POSITION_CLOSE",attempt,closeRef,YD_D_Sell,closeOffset(instrument),closePrice,closeVolume});
+        l.warn("CLEANUP","account="+accountId+" event=RESIDUAL_POSITION_CLOSE_SUBMITTED instrument="+requestedInstrument+" orderRef="+std::to_string(closeRef)+" volume="+std::to_string(closeVolume));
+        const OwnedOrderSettleResult close=waitCleanupClose(s,instrument,closeRef,actionTimeout,l);
+        if(!close.settled){restoreBlocked=true;break;}
+        if(close.finalOrder.ErrorNo!=0){l.error("CLEANUP","position-restoring close was rejected errorNo="+std::to_string(close.finalOrder.ErrorNo));restoreBlocked=true;break;}
+    }
+
+    OrderStreamSnapshot quietSnapshot;
+    const bool callbackStreamQuiet=s.waitOrderActivityQuiet(callbackQuietMilliseconds,actionTimeout,quietSnapshot);
+    int finalOwnedNetLong=0;
+    const bool ownedNetKnown=ownedNetLong(quietSnapshot,tickets,finalOwnedNetLong);
+    const bool noWorkingOrders=allOwnedOrdersSettled(quietSnapshot,tickets);
+    LongPositionSnapshot finalPosition;
+    const bool finalPositionKnown=queryLongSpeculationPosition(s.extendedApi(),ydAccount,instrument,finalPosition);
+    const bool positionRestored=finalPositionKnown&&sameLongPosition(baselinePosition,finalPosition,instrument);
+    const bool safeBeforeStop=!restoreBlocked&&callbackStreamQuiet&&ownedNetKnown&&finalOwnedNetLong==0&&noWorkingOrders&&positionRestored;
+    OrderStreamSnapshot finalSnapshot=quietSnapshot;
+    bool streamStableThroughStop=false;
+    if(safeBeforeStop)streamStableThroughStop=s.stopIfOrderStreamUnchanged(quietSnapshot.activityGeneration,quietSnapshot.sessionGeneration,finalSnapshot);
+    if(!finalSnapshot.destroyed){s.stop();finalSnapshot=s.orderStreamSnapshot();}
+    const OrderActivitySnapshot activity=activityDelta(finalSnapshot.activity,activityBefore);
+    const bool cleanupRestored=safeBeforeStop&&streamStableThroughStop&&activity.callbackValidationFailures==0;
+    const bool monitoringSucceeded=expectedErrorReceived&&cleanupRestored&&activity.orderApiRequests>=1&&activity.orderRequestsSubmitted>=1;
+    const std::string statistics="account="+accountId+" event=ORDER_ERROR_STATISTICS"
+        +" receivedErrors="+(errorCallbackReceived?std::string("1"):std::string("0"))
+        +" source=notifyOrder lastErrorNo="+std::to_string(actualErrorNo)+" lastErrorName="+ydErrorName(actualErrorNo)
+        +" orderApiRequests="+std::to_string(activity.orderApiRequests)
+        +" orderRequestsSubmitted="+std::to_string(activity.orderRequestsSubmitted)
+        +" cancelApiRequests="+std::to_string(activity.cancelApiRequests)
+        +" ownedNetLong="+(ownedNetKnown?std::to_string(finalOwnedNetLong):std::string("UNKNOWN"))
+        +" noWorkingOrders="+(noWorkingOrders?std::string("true"):std::string("false"))
+        +" positionConsistent="+(positionRestored?std::string("true"):std::string("false"))
+        +" streamStableThroughStop="+(streamStableThroughStop?std::string("true"):std::string("false"))
+        +" accountStateNormal="+(cleanupRestored?std::string("true"):std::string("false"));
+    if(monitoringSucceeded){l.info("ERROR_MONITOR",statistics);r.observe("order error monitor snapshot",statistics);}
+    else{
+        l.error("ERROR_MONITOR",statistics);
+        if(!cleanupRestored)l.error("ALERT","MANUAL ACTION REQUIRED account="+accountId+" instrument="+requestedInstrument+"; verify working orders and positions in the broker terminal");
+        r.fail("order error monitor consistency",statistics);
+    }
+},true,true);}
+}
+
+int runTest081InsufficientFunds(const RunOptions& o){return runErrorMessageCase(o,"2.8.1_insufficient_funds",ErrorMessageMode::InsufficientFunds);}
+int runTest082NoPosition(const RunOptions& o){return runErrorMessageCase(o,"2.8.2_no_position",ErrorMessageMode::NoPosition);}
+int runTest083MarketState(const RunOptions& o){return runErrorMessageCase(o,"2.8.3_market_state",ErrorMessageMode::MarketState);}
+int runTest08ErrorMessage(const RunOptions& o){bool known=false;const ErrorMessageMode mode=configuredErrorMode(o,known);if(!known){std::cerr<<"ERROR: use --case no-position|insufficient-funds|market-state"<<std::endl;return 2;}return runErrorMessageCase(o,"2.8_error_message",mode);}
+
+int runTest09PauseTrade(const RunOptions& o){return runEach(o,"2.9_pause_trade",[&](const Account&a,const Config&c,Logger&l,TestResult&r){
+    if(o.live){r.fail("trading control safety","test_09 does not accept --live; no order sent");return;}
+    const int sessionTimeout=std::max(1,c.getInt("Trade.SessionTimeoutSeconds",120));
+    YdSession s(o.ydConfig,a.username,a.password,l,false,monitorThresholds(c),false);
+    if(!readySessionObserved(s,r,sessionTimeout,a.username))return;
+    const std::string instrumentId=instID(o,c);
+    const YDInstrument* instrument=s.instrument(instrumentId);
+    if(!instrument){r.fail("trading control initialization","instrument="+instrumentId+" does not exist; no order sent");return;}
+    const int volume=std::max(1,instrument->MinLimitOrderVolume);
+    if(!usablePrice(instrument->Tick)||volume>instrument->MaxLimitOrderVolume){r.fail("trading control initialization","instrument has no valid limit-order price/volume; no order sent");return;}
+    const double price=instrument->Tick*1000.0;
+    const OrderActivitySnapshot activityStart=s.orderActivity();
+    const TradingControlSnapshot controlStart=s.tradingControl();
+    bool orderIntentObserved=false;
+    bool controlConsistent=true;
+
+    auto dispatchStrategyOrder=[&](){
+        const OrderActivitySnapshot activityBefore=s.orderActivity();
+        const TradingControlSnapshot controlBefore=s.tradingControl();
+        l.info("TRADE","account="+a.username+" event=ORDER_INTENT source=STRATEGY instrument="+instrumentId+" direction=BUY offset=OPEN price="+snapshotNumber(price)+" volume="+std::to_string(volume));
+        const int orderRef=s.sendLimitOrder(instrument,YD_D_Buy,YD_OF_Open,price,volume);
+        const OrderActivitySnapshot activityAfter=s.orderActivity();
+        const TradingControlSnapshot controlAfter=s.tradingControl();
+        orderIntentObserved=true;
+        const bool blocked=orderRef<0
+            &&controlAfter.blockedOrderInstructions==controlBefore.blockedOrderInstructions+1
+            &&activityAfter.orderApiRequests==activityBefore.orderApiRequests
+            &&activityAfter.orderRequestsSubmitted==activityBefore.orderRequestsSubmitted;
+        if(!blocked){
+            controlConsistent=false;
+            l.error("ALERT","account="+a.username+" event=TRADING_CONTROL_INCONSISTENT instrument="+instrumentId+" orderRef="+std::to_string(orderRef));
+        }
+    };
+
+    auto logStatus=[&](){
+        const TradingControlSnapshot control=s.tradingControl();
+        l.info("RISK","account="+a.username+" component=TRADING_CONTROL state="+(control.paused?std::string("PAUSED"):std::string("RUNNING"))+" blockedOrderInstructions="+std::to_string(control.blockedOrderInstructions));
+    };
+
+    l.info("SYSTEM","account="+a.username+" component=TRADING_CONTROL state=RUNNING newOrdersAllowed=true");
+    if(o.interactive){
+        const bool marketSubscribed=s.subscribe(instrument);
+        if(marketSubscribed)l.info("MARKET","account="+a.username+" event=SUBSCRIPTION_ACTIVE instrument="+instrumentId);
+        else l.warn("MARKET","account="+a.username+" event=SUBSCRIPTION_UNAVAILABLE instrument="+instrumentId+" runtimeContinues=true");
+
+        auto normalizeCommand=[](std::string command){
+            command=trim(command);
+            for(char& ch:command)ch=static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            return command;
+        };
+        auto isStopCommand=[](const std::string& command){return command=="quit"||command=="exit"||command=="q"||command==":q"||command==":wq";};
+        std::mutex terminalMu;
+        std::condition_variable terminalCv;
+        std::vector<std::string> terminalCommands;
+        auto pushTerminalCommand=[&](std::string command){
+            {
+                std::lock_guard<std::mutex> lock(terminalMu);
+                terminalCommands.push_back(std::move(command));
+            }
+            terminalCv.notify_one();
+        };
+        std::thread terminalReader([&](){
+#ifdef _WIN32
+            auto normalizeWideCommand=[&](const std::wstring& input){
+                std::string command;
+                command.reserve(input.size());
+                for(wchar_t ch:input){
+                    if(ch==L'\uFF1A')command.push_back(':');
+                    else if(ch>=L'\uFF10'&&ch<=L'\uFF19')command.push_back(static_cast<char>('0'+(ch-L'\uFF10')));
+                    else if(ch>=L'\uFF21'&&ch<=L'\uFF3A')command.push_back(static_cast<char>('A'+(ch-L'\uFF21')));
+                    else if(ch>=L'\uFF41'&&ch<=L'\uFF5A')command.push_back(static_cast<char>('a'+(ch-L'\uFF41')));
+                    else if(ch>=0&&ch<=0x7f)command.push_back(static_cast<char>(ch));
+                }
+                return normalizeCommand(std::move(command));
+            };
+            std::wstring input;
+            for(;;){
+                const int key=_getwch();
+                if(key==WEOF){pushTerminalCommand(":wq");return;}
+                if(key==0||key==0xe0){_getwch();continue;}
+                if(key==8){if(!input.empty())input.pop_back();continue;}
+                if(key==27){input.clear();continue;}
+                if(key=='\r'||key=='\n'){
+                    std::string command=normalizeWideCommand(input);
+                    input.clear();
+                    if(command.empty())continue;
+                    if(command=="wq")command=":wq";
+                    const bool stopReader=isStopCommand(command);
+                    pushTerminalCommand(std::move(command));
+                    if(stopReader)return;
+                    continue;
+                }
+                if(key>=32)input.push_back(static_cast<wchar_t>(key));
+                std::string command=normalizeWideCommand(input);
+                if(command=="wq")command=":wq";
+                if(isStopCommand(command)){
+                    pushTerminalCommand(std::move(command));
+                    return;
+                }
+                if(command=="pause"||command=="resume"||command=="status"||command=="help"){
+                    pushTerminalCommand(std::move(command));
+                    input.clear();
+                }
+            }
+#else
+            for(;;){
+                std::string command;
+                if(!std::getline(std::cin,command))command=":wq";
+                command=normalizeCommand(std::move(command));
+                if(command=="wq")command=":wq";
+                const bool stopReader=isStopCommand(command);
+                pushTerminalCommand(std::move(command));
+                if(stopReader)return;
+            }
+#endif
+        });
+
+        std::uint64_t marketVersion=0;
+        std::uint64_t marketSnapshots=0;
+        auto nextMarketLog=std::chrono::steady_clock::now();
+        auto nextHeartbeat=std::chrono::steady_clock::now();
+        bool done=false;
+        while(!done){
+            std::vector<std::string> commands;
+            {
+                std::unique_lock<std::mutex> lock(terminalMu);
+                terminalCv.wait_for(lock,std::chrono::milliseconds(100),[&](){return !terminalCommands.empty();});
+                commands.swap(terminalCommands);
+            }
+            for(const std::string& command:commands){
+                if(command=="pause"){
+                    if(!s.tradingControl().paused){s.pauseTrading("MANUAL_TERMINAL");dispatchStrategyOrder();}
+                    else logStatus();
+                }else if(command=="resume"){
+                    s.resumeTrading("MANUAL_TERMINAL");
+                }else if(command=="status"){
+                    logStatus();
+                }else if(isStopCommand(command)){
+                    if(!s.tradingControl().paused){s.pauseTrading("MANUAL_TERMINAL");dispatchStrategyOrder();}
+                    l.info("SYSTEM","account="+a.username+" event=SHUTDOWN_REQUESTED source=MANUAL_TERMINAL input="+command+" newOrdersAllowed=false");
+                    done=true;
+                    break;
+                }else if(command=="help"){
+                    std::cout<<"Terminal controls: pause | resume | status | :wq"<<std::endl;
+                }else if(!command.empty()){
+                    l.warn("SYSTEM","account="+a.username+" component=TRADING_RUNTIME event=UNKNOWN_TERMINAL_INPUT input="+command);
+                }
+            }
+            if(done)break;
+
+            YDMarketData market{};
+            if(marketSubscribed&&s.waitNextMarketData(instrument->InstrumentRef,marketVersion,0,market)){
+                ++marketSnapshots;
+                const auto now=std::chrono::steady_clock::now();
+                if(now>=nextMarketLog){
+                    l.info("MARKET","account="+a.username+" event=MARKET_SNAPSHOT instrument="+instrumentId
+                        +" marketTimeStamp="+std::to_string(market.TimeStamp)
+                        +" last="+snapshotNumber(market.LastPrice)+" bid="+snapshotNumber(market.BidPrice)+" ask="+snapshotNumber(market.AskPrice)
+                        +" volume="+std::to_string(market.Volume));
+                    nextMarketLog=now+std::chrono::seconds(2);
+                }
+            }
+            const auto now=std::chrono::steady_clock::now();
+            if(now>=nextHeartbeat){
+                const TradingControlSnapshot control=s.tradingControl();
+                l.info("SYSTEM","account="+a.username+" component=TRADING_RUNTIME state=ACTIVE tradingState="+(control.paused?std::string("PAUSED"):std::string("RUNNING"))+" marketSnapshots="+std::to_string(marketSnapshots));
+                nextHeartbeat=now+std::chrono::seconds(5);
+            }
+        }
+        terminalReader.join();
+    }else{
+        s.pauseTrading("SYSTEM_CONTROL");
+        dispatchStrategyOrder();
+        logStatus();
+        s.resumeTrading("SYSTEM_CONTROL");
+    }
+
+    const OrderActivitySnapshot activityEnd=s.orderActivity();
+    const TradingControlSnapshot controlEnd=s.tradingControl();
+    const std::uint64_t blockedOrders=controlEnd.blockedOrderInstructions-controlStart.blockedOrderInstructions;
+    const std::uint64_t orderApiRequests=activityEnd.orderApiRequests-activityStart.orderApiRequests;
+    const std::uint64_t orderRequestsSubmitted=activityEnd.orderRequestsSubmitted-activityStart.orderRequestsSubmitted;
+    const bool stateNormal=orderIntentObserved&&controlConsistent&&blockedOrders>0&&orderApiRequests==0&&orderRequestsSubmitted==0;
+    const std::string statistics="account="+a.username+" event=TRADING_CONTROL_STATISTICS state="+(controlEnd.paused?std::string("PAUSED"):std::string("RUNNING"))
+        +" blockedOrderInstructions="+std::to_string(blockedOrders)
+        +" orderApiRequests="+std::to_string(orderApiRequests)
+        +" orderRequestsSubmitted="+std::to_string(orderRequestsSubmitted)
+        +" apiCalled="+(orderApiRequests==0?std::string("false"):std::string("true"));
+    if(stateNormal){l.info("RISK",statistics);r.observe("trading control snapshot",statistics);}
+    else{l.error("RISK",statistics);r.fail("trading control consistency",statistics);}
+},true,true);}
+
+int runTest10BatchCancel(const RunOptions& o){return runLiveOrderWorkflow(o,"2.10_batch_cancel",LiveWorkflowMode::BatchCancel);}
+
+int runTest11Logging(const RunOptions& o){
+    if(o.live){std::cerr<<"ERROR: test_11_logging is a read-only log archive audit and does not accept --live."<<std::endl;return 1;}
+    const std::string requestedDate=normalizeArchiveDate(o.logDate);
+    return runEach(o,"2.11_logging",[&](const Account&a,const Config&,Logger&l,TestResult&r){
+        const std::filesystem::path archiveRoot=o.outputRoot;
+        const std::string accountDirectory=a.label.empty()?a.username:a.label;
+        const std::string businessDate=requestedDate.empty()?latestArchivedBusinessDate(archiveRoot,l.file(),accountDirectory,a.username):requestedDate;
+        l.info("LOG_ARCHIVE","account="+a.username+" component=LOG_ARCHIVE state=SCANNING archiveDate="+(businessDate.empty()?std::string("UNAVAILABLE"):businessDate)+" archiveRoot=\""+absolutePathText(archiveRoot)+"\"");
+
+        ArchivedLogScan archive;
+        if(!businessDate.empty())archive=scanArchivedLogs(archiveRoot,l.file(),accountDirectory,a.username,businessDate);
+        const auto emitRecord=[&](const std::string& recordType,const ArchivedLogEvidence& evidence){
+            if(evidence.found)l.info("LOG_ARCHIVE","account="+a.username+" event=LOG_RECORD_INDEXED recordType="+recordType+" sourceFile=\""+absolutePathText(evidence.file)+"\" sourceRecord=\""+evidence.record+"\"");
+            else l.warn("LOG_ARCHIVE","account="+a.username+" event=LOG_RECORD_MISSING recordType="+recordType+" archiveDate="+(businessDate.empty()?std::string("UNAVAILABLE"):businessDate));
+        };
+
+        emitRecord("TRADE_ORDER",archive.trade);
+        if(archive.lifecycle.found){
+            ArchivedLogEvidence started{true,archive.lifecycle.file,archive.lifecycle.started,archive.lifecycle.modified};
+            ArchivedLogEvidence login{true,archive.lifecycle.file,archive.lifecycle.login,archive.lifecycle.modified};
+            ArchivedLogEvidence shutdown{true,archive.lifecycle.file,archive.lifecycle.shutdown,archive.lifecycle.modified};
+            emitRecord("SYSTEM_START",started);
+            emitRecord("SYSTEM_LOGIN",login);
+            emitRecord("SYSTEM_LOGOUT",shutdown);
+        }else{
+            l.warn("LOG_ARCHIVE","account="+a.username+" event=LOG_RECORD_MISSING recordType=SYSTEM_LIFECYCLE archiveDate="+(businessDate.empty()?std::string("UNAVAILABLE"):businessDate));
+        }
+        emitRecord("ORDER_CANCEL_STATISTICS",archive.monitoring);
+        emitRecord("CABINET_ERROR",archive.cabinetError);
+
+        std::error_code pathError;
+        const bool retentionPathAvailable=std::filesystem::exists(l.file(),pathError)&&!pathError;
+        l.info("LOG_ARCHIVE","account="+a.username+" event=LOG_RETENTION_LOCATION archiveRoot=\""+absolutePathText(archiveRoot)+"\" indexFile=\""+absolutePathText(l.file())+"\"");
+
+        std::vector<std::string> missing;
+        if(!archive.trade.found)missing.push_back("TRADE_ORDER");
+        if(!archive.lifecycle.found)missing.push_back("SYSTEM_LIFECYCLE");
+        if(!archive.monitoring.found)missing.push_back("ORDER_CANCEL_STATISTICS");
+        if(!archive.cabinetError.found)missing.push_back("CABINET_ERROR");
+        if(!retentionPathAvailable)missing.push_back("RETENTION_PATH");
+        std::ostringstream missingText;
+        if(missing.empty())missingText<<"none";else for(std::size_t index=0;index<missing.size();++index){if(index)missingText<<',';missingText<<missing[index];}
+        const bool traceable=missing.empty();
+        const std::string statistics="account="+a.username+" event=LOG_ARCHIVE_STATISTICS archiveDate="+(businessDate.empty()?std::string("UNAVAILABLE"):businessDate)
+            +" filesScanned="+std::to_string(archive.filesScanned)
+            +" tradeLog="+(archive.trade.found?std::string("true"):std::string("false"))
+            +" systemRuntimeLog="+(archive.lifecycle.found?std::string("true"):std::string("false"))
+            +" monitoringLog="+(archive.monitoring.found?std::string("true"):std::string("false"))
+            +" cabinetErrorLog="+(archive.cabinetError.found?std::string("true"):std::string("false"))
+            +" retentionPath="+(retentionPathAvailable?std::string("true"):std::string("false"))
+            +" traceable="+(traceable?std::string("true"):std::string("false"))
+            +" missingRecordTypes="+missingText.str();
+        if(traceable){l.info("LOG_ARCHIVE",statistics);r.observe("log archive snapshot",statistics+" indexFile="+absolutePathText(l.file()));}
+        else{l.error("LOG_ARCHIVE",statistics);r.fail("log archive completeness",statistics);}
+    },false,true);
+}
 
 int runAllTests(const RunOptions& o){
     if(o.live){
@@ -777,7 +1883,8 @@ int runAllTests(const RunOptions& o){
     run(runTest08ErrorMessage);
     run(runTest09PauseTrade);
     run(runTest10BatchCancel);
-    run(runTest11Logging);
+    // The logging archive audit depends on real order/cancel and cabinet-error logs.
+    // Run test_11_logging explicitly after those live workflows have been reviewed.
     return rc;
 }
 }

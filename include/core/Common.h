@@ -1,10 +1,12 @@
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <condition_variable>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <functional>

@@ -69,8 +69,10 @@ RunOptions parseArgs(int argc, char** argv) {
         else if (a == "--accounts") o.accounts = next();
         else if (a == "--instrument") o.instrument = next();
         else if (a == "--case") o.caseName = next();
+        else if (a == "--log-date") o.logDate = next();
         else if (a == "--output") o.outputRoot = next();
         else if (a == "--live") o.live = true;
+        else if (a == "--interactive") o.interactive = true;
         else if (a == "--help" || a == "-h") { printCommonUsage(argv[0]); std::exit(0); }
         else throw std::runtime_error("unknown argument: " + a);
     }
@@ -84,7 +86,9 @@ void printCommonUsage(const char* exe) {
               << "  --accounts <csv>        username,password,label CSV\n"
               << "  --instrument <id>       Override test instrument\n"
               << "  --case <name>            Error-message test case\n"
+              << "  --log-date <YYYYMMDD>    Session-start date for the logging archive audit\n"
               << "  --output <dir>           Output root\n"
-              << "  --live                   Allow real order/cancel requests\n";
+              << "  --live                   Allow real order/cancel requests\n"
+              << "  --interactive            Enable manual console commands where supported\n";
 }
 }

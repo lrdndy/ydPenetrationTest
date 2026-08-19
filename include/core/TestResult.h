@@ -3,7 +3,7 @@
 #include "core/Logger.h"
 
 namespace ydtest {
-enum class Outcome { Pass, Fail, Skip };
+enum class Outcome { Pass, Fail, Skip, Observed };
 struct Check { Outcome outcome; std::string name; std::string detail; };
 class TestResult {
 public:
@@ -11,6 +11,7 @@ public:
     void pass(const std::string& name, const std::string& detail = "");
     void fail(const std::string& name, const std::string& detail = "");
     void skip(const std::string& name, const std::string& detail = "");
+    void observe(const std::string& name, const std::string& detail = "");
     bool failed() const;
     bool skippedOnly() const;
     Outcome overall() const;
