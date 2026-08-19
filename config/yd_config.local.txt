@@ -1,0 +1,19 @@
+# Local YD penetration-test environment. This file contains credentials and is git-ignored.
+RecoverySiteCount=0
+TradingServerIP=116.239.24.112
+TradingServerPort=8010
+TradingProtocol=TCP
+TCPTradingCPUID=-1
+XTCPTradingCPUID=-1
+TradingServerTimeout=10
+RecalcMode=off
+TimerCPUID=-1
+ConnectTCPMarketData=yes
+TCPMarketDataServerIP=116.239.24.112
+TCPMarketDataServerPort=8011
+TCPMarketDataTimeout=10
+TCPMarketDataCPUID=-1
+ReceiveUDPMarketData=no
+AppID=zhengjie_yida_3.0
+AuthCode=9F2FJVQ6Z8PCU8YF
+LogDir=log
