@@ -9,9 +9,10 @@ The goal is programmatic testing for external-system certification / penetration
 ## Main tests
 
 - test_01_connect: connectivity and login
-- test_02_basic_trade: open, close, cancel
-- test_03_reconnect: disconnect and reconnect
-- test_04_order_cancel_count
+- test_12_market_position: read-only login, market-data, and current-position snapshot
+- test_02_basic_trade: order-lifecycle flow with 2 opening fills, 2 independent cancellations, and 2 closing fills; every order result includes account/instrument/price/status details and keeps the `--live` gate
+- test_03_reconnect: generation-ordered normal/disconnected/reconnected/re-login/caught-up monitoring; no orders
+- test_04_order_cancel_count: live same-account 2-order/2-cancel monitoring with API/callback counters, ready-session callback quieting, immutable order/trade snapshots, shutdown-boundary validation, and shared position-restoring cleanup; requires `--live`
 - test_05_duplicate_order
 - test_06_threshold
 - test_07_instruction_check
@@ -58,7 +59,7 @@ Generated executables are under:
     notifyFinishInit
     notifyCaughtUp
 
-## Current issue: log flooding in test_02
+## Historical callback handling (implemented)
 
 During `test_02_basic_trade --live`, many historical callbacks are printed:
 
@@ -71,9 +72,7 @@ These are not necessarily orders created by the current test.
 
 YD sends historical order/trade callbacks before `notifyCaughtUp`.
 
-## Required improvement
-
-Do not ignore historical callbacks. Continue maintaining state.
+The current implementation keeps historical callbacks in state while suppressing their per-order/per-trade log flood:
 
 Before caught-up:
 
@@ -85,7 +84,7 @@ After caught-up:
 
 - focus logging on orders created by this test process
 
-Track owned OrderRef values instead of filtering only by instrument.
+After caught-up, callbacks for owned requests are accepted only when the account, instrument, submitted order fields, connection source, and bound system order ID agree; `OrderRef` alone is not treated as physical-order identity.
 
 Do not break:
 

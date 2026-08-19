@@ -2,6 +2,7 @@
 #include "core/Config.h"
 namespace ydtest {
 int runTest01Connect(const RunOptions&);
+int runTest12MarketPosition(const RunOptions&);
 int runTest02BasicTrade(const RunOptions&);
 int runTest03Reconnect(const RunOptions&);
 int runTest04OrderCancelCount(const RunOptions&);

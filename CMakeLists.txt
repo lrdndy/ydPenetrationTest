@@ -45,6 +45,7 @@ function(add_yd_test name)
 endfunction()
 
 add_yd_test(test_01_connect)
+add_yd_test(test_12_market_position)
 add_yd_test(test_02_basic_trade)
 add_yd_test(test_03_reconnect)
 add_yd_test(test_04_order_cancel_count)

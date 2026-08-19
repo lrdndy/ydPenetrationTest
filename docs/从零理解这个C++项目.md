@@ -110,7 +110,6 @@ account 2
 
 不需要发单：
 
-- 2.4 报撤单统计
 - 2.5 重复报单
 - 2.6 阈值预警
 - 2.9 暂停交易
@@ -127,6 +126,7 @@ account 2
 必须加 `--live`：
 
 - 2.2 开仓、平仓、撤单
+- 2.4 同一真实账号报单、撤单及笔数监测
 - 2.8 柜台错误提示
 - 2.10 批量撤单
 
@@ -144,22 +144,23 @@ account 2
 
 因此项目默认禁止真实交易测试。
 
-只有：
+例如：
 
 ```bat
-test_02_basic_trade.exe --live
+test_02_basic_trade.exe --accounts config\accounts.local.csv --instrument au2612 --live
+test_04_order_cancel_count.exe --accounts config\accounts.local.csv --instrument au2612 --live
 ```
 
 才允许执行会报撤单的测试逻辑。
 
-## 7. 如何增加第 12 项测试
+## 7. 如何增加第 13 项测试
 
 假设以后新增“密码修改测试”：
 
 1. 在 `include/tests/TestCases.h` 增加：
 
 ```cpp
-int runTest12Password(const RunOptions&);
+int runTest13Password(const RunOptions&);
 ```
 
 2. 在 `src/tests/TestCases.cpp` 写测试逻辑。
@@ -167,7 +168,7 @@ int runTest12Password(const RunOptions&);
 3. 新建：
 
 ```text
-apps/test_12_password.cpp
+apps/test_13_password.cpp
 ```
 
 只写一个很短的 main：
@@ -176,18 +177,18 @@ apps/test_12_password.cpp
 #include "tests/TestCases.h"
 int main(int argc, char** argv) {
     auto o = ydtest::parseArgs(argc, argv);
-    return ydtest::runTest12Password(o);
+    return ydtest::runTest13Password(o);
 }
 ```
 
 4. `CMakeLists.txt` 增加：
 
 ```cmake
-add_yd_test(test_12_password)
+add_yd_test(test_13_password)
 ```
 
 重新编译后就得到：
 
 ```text
-build/bin/test_12_password.exe
+build/bin/test_13_password.exe
 ```
