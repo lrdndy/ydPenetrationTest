@@ -2,6 +2,7 @@
 #include "core/Common.h"
 #include "core/Logger.h"
 #include "core/Monitor.h"
+#include "core/SystemOrderIdentity.h"
 #include "ydApi.h"
 
 namespace ydtest {
@@ -128,9 +129,7 @@ private:
         bool apiCallStarted=false;
         bool apiSubmitted=false;
         bool acceptedObserved=false;
-        bool systemBound=false;
-        long long orderSysId=0;
-        long long longOrderSysId=0;
+        SystemOrderIdentity systemIdentity;
         bool hasOrder=false;
         YDOrder latest{};
         std::uint64_t lastOrderCallbackGeneration=0;

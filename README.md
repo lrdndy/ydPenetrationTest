@@ -7,7 +7,7 @@
 
 - `ydapi/`：YD 1.502 SDK 的头文件和 Win64/Linux64 动态库
 - `include/core + src/core`：公共 YD 会话、日志、监控、指令检查
-- `src/tests/TestCases.cpp`：附件3的 2.1~2.11 测试逻辑，以及补充的只读 1.2 行情/持仓快照
+- `src/tests/TestCases.cpp`：附件3的 2.1~2.11 测试逻辑、补充的只读 1.2 行情/持仓快照，以及独立的安全卖出回路测试
 - `apps/test_XX_*.cpp`：每个文件只有 `main()`，编译成一个独立 exe
 - `config/accounts.local.csv`：多账户批量运行（不要提交 Git）
 - `config/yd_config.local.txt`：本机 YD 柜台、行情及认证参数（不要提交 Git）
@@ -34,6 +34,7 @@ build\bin\test_01_connect.exe
 build\bin\test_12_market_position.exe
 ...
 build\bin\test_11_logging.exe
+build\bin\test_13_sell_ag2610.exe
 build\bin\test_all.exe
 ```
 
@@ -181,25 +182,34 @@ Validation.RepeatCount=3
 build\bin\test_02_basic_trade.exe --accounts config\accounts.local.csv --instrument au2612 --live
 build\bin\test_04_order_cancel_count.exe --accounts config\accounts.local.csv --instrument au2612 --live
 build\bin\test_10_batch_cancel.exe --accounts config\accounts.local.csv --instrument au2612 --live
+build\bin\test_13_sell_ag2610.exe --accounts config\accounts.local.csv --live
 ```
 
-`test_02_basic_trade` 对应 3.2.2 基础交易流程：按顺序逐笔完成 **2 笔买开成交、2 笔独立撤单、2 笔卖平成交**。每笔 `[ORDER_RESULT]` 日志都包含账号、结果时间、合约、方向、开平、柜台回报的委托价、成交价（撤单无成交价）、数量、OrderRef、系统编号、错误码和最终状态。为避免误平旧仓，程序只允许选择该账号当前“投机多仓为 0”的合约，并记录测试前后的仓位数量。任一步骤失败时，程序会先撤销本测试仍在工作的委托，再尝试平掉本测试实际新增的仓位；若无法确认订单终态、净新增仓位归零和仓位数量恢复，会输出 `MANUAL ACTION REQUIRED` 并停止后续账号。
+`test_13_sell_ag2610` 是独立的实盘卖出回路测试。未传 `--instrument` 时固定使用 `ag2610`，也可显式覆盖为其他合约。程序先买开 1 手，在仓位查询确认相对基线准确增加 1 手后，再卖出平仓 1 手；支持平今的交易所使用 `CLOSE_TODAY`，否则使用 `CLOSE`。最终必须确认两笔均成交、所有委托终态稳定且今仓/历史仓/其他仓数量逐项回到启动基线。账号 CSV 中的每一行都会依次产生两笔真实成交，建议使用只含目标账号的专用 CSV。它不会加入 `test_all`，必须单独运行并显式添加 `--live`；不要在生产账户上执行。若使用 `--allow-existing-today-position`，只能用于明确接受原今仓批次/成本明细可能变化的既有基线，不能把先前 `MANUAL ACTION REQUIRED` 的异常遗留仓吸收为新基线。
 
-`test_04_order_cancel_count` 对应 3.3.1.2 报撤单笔数监测。它使用同一真实登录账号逐笔发送 **2 张一手被动限价单**，每张收到柜台排队回报后分别撤单。计数发生在真实 `insertOrder` / `cancelOrder` 调用边界，并结合账号、合约、订单字段和系统单号绑定柜台回报；最终判定前会在连接、登录和历史追平均正常时等待本测试订单回报流进入静默窗口，重新核对委托累计成交量与成交回报量，并在关闭 API 前原子确认快照没有变化，关闭后再检查是否出现迟到回报。`[COUNT_RESULT]` 同时打印 API 请求数、成功提交数、柜台受理委托数、撤单请求数、确认撤单数、失败撤单回报、身份校验失败数、成交量一致性、回报流封口状态和清理状态。测试只允许选择该账号当前“投机多仓为 0”的合约，并复用 `test_02` 的失败清理：被动单意外成交时会判定测试失败并尝试恢复仓位，无法确认恢复时输出 `MANUAL ACTION REQUIRED`。
+仅当支持平今且账号中的非零今仓是明确要保留的数量基线时，才额外使用：
+
+```bat
+build\bin\test_02_basic_trade.exe --accounts config\accounts.local.csv --instrument au2612 --live --allow-existing-today-position
+```
+
+`test_02_basic_trade` 对应 3.2.2 基础交易流程：按顺序逐笔完成 **2 笔买开成交、2 笔独立撤单、2 笔卖平成交**。每笔 `[ORDER_RESULT]` 日志都包含账号、结果时间、合约、方向、开平、柜台回报的委托价、成交价（撤单无成交价）、数量、OrderRef、系统编号、错误码和最终状态。仓位预检按交易所规则自动保护原仓：若 YD 静态数据表明合约支持平今（`UseTodayPosition=true`），默认可保留已有历史投机多仓，但基线投机今多仓和未知日期仓必须为 0；若确实要在有意保留的非零今仓数量上加仓，可额外显式添加 `--allow-existing-today-position`，但程序只能保证最终今仓数量恢复，不能保证平掉的是新开持仓明细，也不能保证原今仓成本明细不变。测试开仓及异常清理统一使用 `CLOSE_TODAY`，最终逐项核对今仓、历史仓和其他仓位数量均恢复到基线。其他交易所仍要求测试前投机多仓总量为 0，避免普通 `CLOSE` 影响原有仓位。任一步骤失败时，程序会先撤销本测试仍在工作的委托，再尝试平掉本测试实际新增的仓位；若无法确认订单终态、净新增仓位归零和仓位结构恢复，会输出 `MANUAL ACTION REQUIRED` 并停止后续账号。出现过 `MANUAL ACTION REQUIRED` 的遗留今仓必须先人工核对和恢复，不得用该选项直接吸收为新基线。
+
+`test_04_order_cancel_count` 对应 3.3.1.2 报撤单笔数监测。它使用同一真实登录账号逐笔发送 **2 张一手被动限价单**，每张收到柜台排队回报后分别撤单。计数发生在真实 `insertOrder` / `cancelOrder` 调用边界，并结合账号、合约、订单字段和系统单号绑定柜台回报；最终判定前会在连接、登录和历史追平均正常时等待本测试订单回报流进入静默窗口，重新核对委托累计成交量与成交回报量，并在关闭 API 前原子确认快照没有变化，关闭后再检查是否出现迟到回报。`[COUNT_RESULT]` 同时打印 API 请求数、成功提交数、柜台受理委托数、撤单请求数、确认撤单数、失败撤单回报、身份校验失败数、成交量一致性、回报流封口状态和清理状态。仓位预检与 `test_02` 相同：支持平今时默认允许保留历史投机多仓；非零今仓数量只在显式添加 `--allow-existing-today-position` 时允许，未知日期仓仍必须为 0；其他合约仍要求投机多仓总量为 0。被动单意外成交时只恢复本测试可归属的净新增仓位，并核对仓位数量回到基线；无法确认恢复时输出 `MANUAL ACTION REQUIRED`。
 
 `test_10_batch_cancel` 采用选测测试点2“多笔已报单批量撤单”。它提交 **2 张一手被动买开单**，逐张确认属于当前会话、柜台状态为 `QUEUING`、系统单号已绑定且成交量为 0；随后只调用一次 YD `cancelMultiOrders`，再根据两张订单各自的柜台回报确认均为 `CANCELED`。公共批撤入口会在整批调用前再次核验订单归属、最新状态、合约和系统单号，任一目标不一致则整批不调用 API。成功路径不打印人为 `PASS`，最终输出 `BATCH_CANCEL_STATISTICS`，其中 `batchApiCalls=1` 证明使用的是一次批量调用，`batchTargetOrders=2`、`confirmedCancellations=2` 和 `canceledOrders=2` 证明两张委托均被撤销。
 
-该流程复用基础交易测试的仓位安全边界：测试前要求所选合约投机多仓为 0，价格由新鲜盘口按 `BatchCancel.WorkingOrderOffsetTicks` 构造；如果被动单意外部分或全部成交，测试不会把它冒充测试点1，而是判定异常、撤销剩余数量，并只按本程序验证过的订单和成交回报恢复净新增多仓。最终必须同时满足 `unexpectedTradeVolume=0`、`noWorkingOrders=true`、`ownedNetLong=0`、`positionRestored=true`、`callbackStreamQuiet=true`、`streamStableThroughStop=true` 和 `cleanupRestored=true`。出现 `MANUAL ACTION REQUIRED` 时立即到柜台客户端核对。
+该流程复用基础交易测试的仓位安全边界：支持平今时默认允许已有历史投机多仓；非零今仓数量只在显式添加 `--allow-existing-today-position` 时允许，未知日期仓仍必须为 0；其他合约仍要求投机多仓总量为 0。价格由新鲜盘口按 `BatchCancel.WorkingOrderOffsetTicks` 构造；如果被动单意外部分或全部成交，测试不会把它冒充测试点1，而是判定异常、撤销剩余数量，并只按本程序验证过的订单和成交回报恢复净新增多仓。`ownedNetLong=0` 表示本测试订单的净新增多仓已归零，并不要求账户历史总多仓为 0。最终必须同时满足 `unexpectedTradeVolume=0`、`noWorkingOrders=true`、`ownedNetLong=0`、`positionRestored=true`、`callbackStreamQuiet=true`、`streamStableThroughStop=true` 和 `cleanupRestored=true`。出现 `MANUAL ACTION REQUIRED` 时立即到柜台客户端核对。
 
-运行前必须把 `--instrument` 换成柜台测试环境当前可交易、流动性足够且该账号投机多仓为 0 的合约，并确认账户允许开仓。从程序启动到退出并打印最终统计之前，该账号不得由其他客户端或程序并发报撤单，以免不同终端复用相同引用号。`test_04` 验收时检查 `[COUNT_RESULT] status=PASS`；`test_10` 检查 `[BATCH_CANCEL_STATISTICS]` 中的批次、逐单确认和安全字段。两者都要求 `tradeVolumeConsistent=true`、`callbackStreamQuiet=true`、`streamStableThroughStop=true` 和 `cleanupRestored=true`；任一稳定性字段为 `false` 都按失败处理并人工核对。不要在生产账户上执行。
+运行前必须把 `--instrument` 换成柜台测试环境当前可交易、流动性足够并满足仓位预检的合约：支持平今的合约可保留历史多仓；基线今多仓默认必须为 0，只有明确接受持仓明细可能变化时才添加 `--allow-existing-today-position`；未知日期仓仍必须为 0。不支持平今的合约要求投机多仓总量为 0。还须确认账户允许开仓。从程序启动到退出并打印最终统计之前，该账号不得由其他客户端或程序并发报撤单，以免不同终端复用相同引用号。`test_04` 验收时检查 `[COUNT_RESULT] status=PASS`；`test_10` 检查 `[BATCH_CANCEL_STATISTICS]` 中的批次、逐单确认和安全字段。两者都要求 `tradeVolumeConsistent=true`、`callbackStreamQuiet=true`、`streamStableThroughStop=true` 和 `cleanupRestored=true`；任一稳定性字段为 `false` 都按失败处理并人工核对。不要在生产账户上执行。
 
 ### 2.8 错误提示
 
 三个必测点分别使用独立程序。它们通过真实 `YdSession` 报单入口向柜台发送指令，并从本程序拥有订单的 `notifyOrder` 回调接收 `ErrorNo`。终端会自然显示 `[ERROR] event=ORDER_REJECTED source=notifyOrder`，包含账号、合约、错误码和可读错误名称；成功路径不打印人为的 `PASS`，最终以生产式 `ORDER_ERROR_STATISTICS` 留存错误接收及账户状态证据。程序内部日志不显示预期错误码、测试场景或匹配结论。
 
 ```bat
-rem 测试点1：账号资金必须不足以承担配置数量的开仓保证金
-build\bin\test_08_1_insufficient_funds.exe --accounts config\accounts.local.csv --instrument au2612 --live
+rem 测试点1：多笔小单累计冻结资金，直到柜台拒绝
+build\bin\test_08_1_insufficient_funds.exe --accounts config\accounts.local.csv --instrument ag2610 --live
 
 rem 测试点2：程序会先确认该账号在该合约上的投机多仓为0
 build\bin\test_08_2_no_position.exe --accounts config\accounts.local.csv --instrument au2612 --live
@@ -210,9 +220,9 @@ build\bin\test_08_3_market_state.exe --accounts config\accounts.local.csv --inst
 
 预期错误码分别为：资金不足 `2`，无仓可平 `1`，市场状态不允许 `37/66/93/133/138`。柜台返回其他错误时仍会原样显示，但不会把它归入目标错误类别。
 
-三个程序都必须显式指定 `--live`，且只能在经纪商批准的测试环境和测试账号上运行。为了降低柜台未拒绝时的风险，程序要求测试前投机多仓为 0，并使用距离盘口 `ErrorTest.PassiveOffsetTicks` 个 Tick 的被动价格；若指令被受理则立即撤单，若发生意外开仓，只根据本程序拥有订单的回报尝试恢复净新增仓位。清理状态不完整时会显示 `MANUAL ACTION REQUIRED`，此时必须立即到柜台客户端核对。
+三个程序都必须显式指定 `--live`，且只能在经纪商批准的测试环境和测试账号上运行。`test_08_1_insufficient_funds` 使用“多笔委托逐步占用资金”的方式：连续提交小数量的被动买开单，每张确认处于未成交排队状态后继续提交下一张，并保留前序挂单，直到柜台首次返回任一错误或达到 100 笔硬上限；只有首个错误是资金不足 `ErrorNo=2` 且至少实际提交 2 笔时，本项错误监测才成立。随后程序立即停止新报单，先快速撤销本测试全部工作单，再只根据本程序拥有订单的回报恢复意外新增多仓，最终核对无工作单且仓位数量回到启动基线。该测试不会因合约已有投机多仓而阻止，但只能保证最终数量恢复，不能保证已有今仓的批次或成本明细不变。`test_08_2_no_position` 为了制造“无仓可平”仍要求投机多仓为 0；`test_08_3_market_state` 仍保留零仓安全预检。
 
-资金不足不能由程序凭空保证，需根据测试账号资金和合约保证金调整 `ErrorTest.InsufficientFundsVolume`，且数量必须处于该合约单笔委托范围内。收盘后若订阅不到有效盘口，可将 `ErrorTest.OrderPrice` 从 `0` 改为该合约当日合法价位。原来的 `test_08_error_message.exe --case no-position|insufficient-funds|market-state` 继续保留为兼容入口。
+资金不足不能由程序凭空保证。`ErrorTest.InsufficientFundsOrderVolume` 设置每笔数量，`ErrorTest.InsufficientFundsMaxOrders` 设置最多尝试笔数（程序硬限制为 100）；默认是每笔 1 手、最多 100 笔。`ErrorTest.InsufficientFundsOrderIntervalMilliseconds` 默认将相邻真实报单至少间隔 500ms，避免高速行情下瞬间打满 100 笔而先触发频率限制。最大累计数量不得超过 `ErrorTest.InsufficientFundsMaxRestoreAttempts × MaxLimitOrderVolume`，否则预检直接拒绝且一笔不发。程序从首次盘口构造一个固定买开价；每次报单前必须等到更新的盘口，并确认该固定价格仍合法且同时低于当前买价和卖价，同时复核此前全部工作单仍为零成交排队状态。因此该模式不使用可能主动成交的“大价格”。`ORDER_LOAD_PROGRESS` 持续显示累计报单数和工作单数；最终 `ORDER_ERROR_STATISTICS` 还会逐笔确认前 N−1 笔均已撤且零成交、第 N 笔恰为资金不足，并显示撤单覆盖、意外成交量、回报一致性及账户恢复状态。原来的 `test_08_error_message.exe --case no-position|insufficient-funds|market-state` 继续保留为兼容入口。
 
 ### 2.9 暂停交易
 

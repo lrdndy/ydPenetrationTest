@@ -30,6 +30,7 @@ struct RunOptions {
     std::string logDate;
     std::string outputRoot = "output";
     bool live = false;
+    bool allowExistingTodayPosition = false;
     bool interactive = false;
 };
 

@@ -1,0 +1,19 @@
+# Local SupremeMM penetration-test environment. This file contains credentials and is git-ignored.
+RecoverySiteCount=0
+TradingServerIP=101.226.254.150
+TradingServerPort=51000
+TradingProtocol=TCP
+TCPTradingCPUID=-1
+XTCPTradingCPUID=-1
+TradingServerTimeout=10
+RecalcMode=off
+TimerCPUID=-1
+ConnectTCPMarketData=yes
+TCPMarketDataServerIP=101.226.254.150
+TCPMarketDataServerPort=51001
+TCPMarketDataTimeout=10
+TCPMarketDataCPUID=-1
+ReceiveUDPMarketData=no
+AppID=client_SupremeMM_1.0
+AuthCode=0PZE6IYGEXMUBE3S
+LogDir=log

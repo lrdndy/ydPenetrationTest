@@ -72,6 +72,7 @@ RunOptions parseArgs(int argc, char** argv) {
         else if (a == "--log-date") o.logDate = next();
         else if (a == "--output") o.outputRoot = next();
         else if (a == "--live") o.live = true;
+        else if (a == "--allow-existing-today-position") o.allowExistingTodayPosition = true;
         else if (a == "--interactive") o.interactive = true;
         else if (a == "--help" || a == "-h") { printCommonUsage(argv[0]); std::exit(0); }
         else throw std::runtime_error("unknown argument: " + a);
@@ -89,6 +90,8 @@ void printCommonUsage(const char* exe) {
               << "  --log-date <YYYYMMDD>    Session-start date for the logging archive audit\n"
               << "  --output <dir>           Output root\n"
               << "  --live                   Allow real order/cancel requests\n"
+              << "  --allow-existing-today-position\n"
+              << "                           Permit a non-zero today-position quantity baseline\n"
               << "  --interactive            Enable manual console commands where supported\n";
 }
 }

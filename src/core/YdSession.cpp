@@ -36,12 +36,9 @@ namespace ydtest {
 		bool samePrice(double expected, double actual, double tick) {
 			return std::isfinite(actual) && std::fabs(expected - actual) <= std::max(1e-9, std::max(std::fabs(expected) * 1e-12, std::fabs(tick) * 1e-6));
 		}
-		bool hasSystemOrderId(long long orderSysId, long long longOrderSysId) { return orderSysId != 0 || longOrderSysId != 0; }
-		bool compatibleSystemOrderIds(long long boundOrderSysId, long long boundLongOrderSysId, long long orderSysId, long long longOrderSysId) {
-			bool compared = false;
-			if (boundLongOrderSysId != 0 && longOrderSysId != 0) { compared = true; if (boundLongOrderSysId != longOrderSysId)return false; }
-			if (boundOrderSysId != 0 && orderSysId != 0) { compared = true; if (boundOrderSysId != orderSysId)return false; }
-			return compared;
+		std::string systemOrderIdText(long long orderSysId, long long longOrderSysId) {
+			const long long value = preferredSystemOrderId(orderSysId, longOrderSysId);
+			return value > 0 ? std::to_string(value) : std::string("N/A");
 		}
 		const char* apiEventName(int value) {
 			switch (value) {
@@ -250,9 +247,10 @@ namespace ydtest {
 					const OwnedOrderState& state = found->second;
 					const long long suppliedSys = static_cast<long long>(o.OrderSysID), suppliedLongSys = static_cast<long long>(o.LongOrderSysID);
 					if (state.instrumentRef != i->InstrumentRef || state.latest.OrderStatus != YD_OS_Queuing || state.latest.ErrorNo != 0)blockedReason = "owned order is no longer cancelable";
-					else if (!state.systemBound || !hasSystemOrderId(suppliedSys, suppliedLongSys) || !compatibleSystemOrderIds(state.orderSysId, state.longOrderSysId, suppliedSys, suppliedLongSys))blockedReason = "order identity/system ID mismatch";
+					else if (!state.systemIdentity.matches(suppliedSys, suppliedLongSys))blockedReason = "order identity/system ID mismatch";
 					else {
-						c.LongOrderSysID = static_cast<YDLongOrderSysID>(state.longOrderSysId); if (c.LongOrderSysID == 0)c.OrderSysID = static_cast<YDSysOrderID>(state.orderSysId);
+						if (isAssignedYdId(state.systemIdentity.longOrderSysId()))c.LongOrderSysID = static_cast<YDLongOrderSysID>(state.systemIdentity.longOrderSysId());
+						else c.OrderSysID = static_cast<YDSysOrderID>(state.systemIdentity.orderSysId());
 						CancelAttemptState attempt; attempt.attemptId = attemptId = nextCancelAttemptId_++; attempt.afterOrderCallbackGeneration = orderCallbackGeneration_;
 						cancelAttempts_[o.OrderRef] = attempt; requestCount = ++cancelApiRequests_;
 					}
@@ -306,10 +304,10 @@ namespace ydtest {
 				const OwnedOrderState& state = found->second;
 				const long long suppliedSys = static_cast<long long>(supplied.OrderSysID), suppliedLongSys = static_cast<long long>(supplied.LongOrderSysID);
 				if (state.instrumentRef != instrument->InstrumentRef || state.latest.OrderStatus != YD_OS_Queuing || state.latest.ErrorNo != 0) { blockedReason = "owned order is no longer cancelable"; break; }
-				if (!state.systemBound || !hasSystemOrderId(suppliedSys, suppliedLongSys) || !compatibleSystemOrderIds(state.orderSysId, state.longOrderSysId, suppliedSys, suppliedLongSys)) { blockedReason = "order identity/system ID mismatch"; break; }
+				if (!state.systemIdentity.matches(suppliedSys, suppliedLongSys)) { blockedReason = "order identity/system ID mismatch"; break; }
 				std::memset(&cancels[n], 0, sizeof(YDCancelOrder));
-				cancels[n].LongOrderSysID = static_cast<YDLongOrderSysID>(state.longOrderSysId);
-				if (cancels[n].LongOrderSysID == 0)cancels[n].OrderSysID = static_cast<YDSysOrderID>(state.orderSysId);
+				if (isAssignedYdId(state.systemIdentity.longOrderSysId()))cancels[n].LongOrderSysID = static_cast<YDLongOrderSysID>(state.systemIdentity.longOrderSysId());
+				else cancels[n].OrderSysID = static_cast<YDSysOrderID>(state.systemIdentity.orderSysId());
 				exchanges[n] = instrument->m_pExchange;
 				intents.push_back({ instrument->InstrumentID,state.direction,state.offset,state.price,state.volume,true });
 				if (n)targetRefs << ',';
@@ -468,6 +466,9 @@ namespace ydtest {
 			if (found != ownedOrders_.end()) {
 				OwnedOrderState& state = found->second; shouldLog = true; ++orderActivityGeneration_;
 				const long long incomingSys = static_cast<long long>(o->OrderSysID), incomingLongSys = static_cast<long long>(o->LongOrderSysID);
+				const bool acceptedStatus = o->OrderStatus == YD_OS_Accepted || o->OrderStatus == YD_OS_Queuing || o->OrderStatus == YD_OS_AllTraded || o->OrderStatus == YD_OS_Canceled;
+				const SystemOrderIdEvidence systemIdEvidence = o->ErrorNo != 0 ? SystemOrderIdEvidence::Ignore
+					: (acceptedStatus ? SystemOrderIdEvidence::BindOrMatch : SystemOrderIdEvidence::ValidateOnly);
 				if (!state.apiCallStarted)validationReason = "callback preceded the API request";
 				else if (!a || a->AccountRef != state.accountRef)validationReason = "account mismatch";
 				else if (!i || i->InstrumentRef != state.instrumentRef)validationReason = "instrument mismatch";
@@ -475,14 +476,11 @@ namespace ydtest {
 				else if (o->OrderType != state.orderType || o->YDOrderFlag != state.orderFlag || o->OrderGroupID != 0)validationReason = "order type/flag/group mismatch";
 				else if (o->OrderVolume != state.volume || !samePrice(state.price, o->Price, state.tick))validationReason = "price/volume mismatch";
 				else if (static_cast<int>(o->RealConnectionID) < 0)validationReason = "callback came from another system connection";
-				else if (state.systemBound && (!hasSystemOrderId(incomingSys, incomingLongSys) || !compatibleSystemOrderIds(state.orderSysId, state.longOrderSysId, incomingSys, incomingLongSys)))validationReason = "system order ID mismatch";
+				else if (!observeSystemOrderId(state.systemIdentity, systemIdEvidence, incomingSys, incomingLongSys))validationReason = "system order ID mismatch";
 				if (!validationReason.empty()) { validationFailed = true; shouldLog = false; ++callbackValidationFailures_; }
 				else {
-					if (!state.systemBound && hasSystemOrderId(incomingSys, incomingLongSys)) { state.systemBound = true; state.orderSysId = incomingSys; state.longOrderSysId = incomingLongSys; }
-					else if (state.systemBound) { if (state.orderSysId == 0)state.orderSysId = incomingSys; if (state.longOrderSysId == 0)state.longOrderSysId = incomingLongSys; }
 					state.hasOrder = true; state.latest = *o; state.lastOrderCallbackGeneration = callbackGeneration;
-					const bool acceptedStatus = o->OrderStatus == YD_OS_Accepted || o->OrderStatus == YD_OS_Queuing || o->OrderStatus == YD_OS_AllTraded || o->OrderStatus == YD_OS_Canceled;
-					if (o->ErrorNo == 0 && acceptedStatus && state.systemBound) { state.acceptedObserved = true; if (state.apiSubmitted)newlyAccepted = acceptedOrderRefs_.insert(o->OrderRef).second; }
+					if (o->ErrorNo == 0 && acceptedStatus && state.systemIdentity.bound()) { state.acceptedObserved = true; if (state.apiSubmitted)newlyAccepted = acceptedOrderRefs_.insert(o->OrderRef).second; }
 					if (o->ErrorNo == 0 && o->OrderStatus == YD_OS_Canceled) {
 						auto attempt = cancelAttempts_.find(o->OrderRef);
 						if (attempt != cancelAttempts_.end() && callbackGeneration > attempt->second.afterOrderCallbackGeneration) {
@@ -514,20 +512,21 @@ namespace ydtest {
 			auto found = ownedOrders_.find(t->OrderRef);
 			if (found != ownedOrders_.end()) {
 				const OwnedOrderState& state = found->second; ++orderActivityGeneration_; const long long incomingSys = static_cast<long long>(t->OrderSysID), incomingLongSys = static_cast<long long>(t->LongOrderSysID);
-				if (!state.apiSubmitted || !state.systemBound)validationReason = "owned order is not submitted/bound";
+				if (!state.apiSubmitted || !state.systemIdentity.bound())validationReason = "owned order is not submitted/bound";
 				else if (t->AccountRef != state.accountRef || (a && a->AccountRef != state.accountRef))validationReason = "account mismatch";
 				else if (t->InstrumentRef != state.instrumentRef || !i || i->InstrumentRef != state.instrumentRef)validationReason = "instrument mismatch";
 				else if (t->Direction != state.direction || t->OffsetFlag != state.offset || t->HedgeFlag != state.hedge)validationReason = "direction/offset/hedge mismatch";
 				else if (t->OrderGroupID != 0 || t->YDTradeFlag != YD_YTF_Normal || static_cast<int>(t->RealConnectionID) < 0)validationReason = "trade flag/group/connection mismatch";
-				else if (!hasSystemOrderId(incomingSys, incomingLongSys) || !compatibleSystemOrderIds(state.orderSysId, state.longOrderSysId, incomingSys, incomingLongSys))validationReason = "system order ID mismatch";
+				else if (!isAssignedYdId(t->TradeID) && !isAssignedYdId(t->LongTradeID))validationReason = "trade ID unavailable";
+				else if (!state.systemIdentity.matches(incomingSys, incomingLongSys))validationReason = "system order ID mismatch";
 				if (validationReason.empty()) { ownedTrades_.push_back(*t); shouldLog = true; }
 				else { validationFailed = true; ++callbackValidationFailures_; }
 			}
 			cv_.notify_all();
 		}
 		const std::string account = accountName(a, username_); const std::string instrument = i ? std::string(i->InstrumentID) : std::string();
-		if (validationFailed)log_.warn("VALIDATION", "ignored trade callback account=" + account + " ref=" + std::to_string(t->OrderRef) + " instrument=" + instrument + " reason=" + validationReason + " orderSysId=" + std::to_string(t->LongOrderSysID != 0 ? t->LongOrderSysID : static_cast<long long>(t->OrderSysID)));
-		if (!shouldLog)return; std::ostringstream s; s << "notifyTrade account=" << account << " ref=" << t->OrderRef << " instrument=" << instrument << " direction=" << directionName(t->Direction) << " offset=" << offsetName(t->OffsetFlag) << " tradePrice=" << numberText(t->Price) << " volume=" << t->Volume << " tradeId=" << (t->LongTradeID != 0 ? t->LongTradeID : static_cast<long long>(t->TradeID)) << " orderSysId=" << (t->LongOrderSysID != 0 ? t->LongOrderSysID : static_cast<long long>(t->OrderSysID)); log_.info("TRADE", s.str());
+		if (validationFailed)log_.warn("VALIDATION", "ignored trade callback account=" + account + " ref=" + std::to_string(t->OrderRef) + " instrument=" + instrument + " reason=" + validationReason + " orderSysId=" + systemOrderIdText(t->OrderSysID, t->LongOrderSysID));
+		if (!shouldLog)return; std::ostringstream s; s << "notifyTrade account=" << account << " ref=" << t->OrderRef << " instrument=" << instrument << " direction=" << directionName(t->Direction) << " offset=" << offsetName(t->OffsetFlag) << " tradePrice=" << numberText(t->Price) << " volume=" << t->Volume << " tradeId=" << (isAssignedYdId(t->LongTradeID) ? t->LongTradeID : static_cast<long long>(t->TradeID)) << " orderSysId=" << systemOrderIdText(t->OrderSysID, t->LongOrderSysID); log_.info("TRADE", s.str());
 	}
 	void YdSession::notifyFailedCancelOrder(const YDFailedCancelOrder* f, const YDExchange*, const YDAccount* a) {
 		if (!f)return; bool ownedAttempt = false, validationFailed = false; std::string validationReason;
@@ -536,7 +535,7 @@ namespace ydtest {
 				OwnedOrderState& state = found->second; const long long incomingSys = static_cast<long long>(f->OrderSysID), incomingLongSys = static_cast<long long>(f->LongOrderSysID);
 				if (f->AccountRef != state.accountRef || (a && a->AccountRef != state.accountRef))validationReason = "account mismatch";
 				else if (f->YDOrderFlag != state.orderFlag || f->OrderGroupID != 0)validationReason = "order flag/group mismatch";
-				else if (!state.systemBound || !hasSystemOrderId(incomingSys, incomingLongSys) || !compatibleSystemOrderIds(state.orderSysId, state.longOrderSysId, incomingSys, incomingLongSys))validationReason = "system order ID mismatch";
+				else if (!state.systemIdentity.matches(incomingSys, incomingLongSys))validationReason = "system order ID mismatch";
 				if (validationReason.empty()) {
 					ownedAttempt = true;
 					if (!attempt->second.failed) { attempt->second.failed = true; attempt->second.errorNo = f->ErrorNo; ++failedCancelCallbacks_; if (attempt->second.confirmed) { attempt->second.confirmed = false; if (confirmedCancellations_ > 0)--confirmedCancellations_; } }
@@ -545,8 +544,8 @@ namespace ydtest {
 			cv_.notify_all();
 		}
 		const std::string account = accountName(a, username_);
-		if (validationFailed)log_.warn("VALIDATION", "ignored failed-cancel callback account=" + account + " ref=" + std::to_string(f->OrderRef) + " reason=" + validationReason + " orderSysId=" + std::to_string(f->LongOrderSysID != 0 ? f->LongOrderSysID : static_cast<long long>(f->OrderSysID)));
-		if (ownedAttempt) { std::ostringstream s; s << "notifyFailedCancelOrder account=" << account << " ref=" << f->OrderRef << " orderSysId=" << (f->LongOrderSysID != 0 ? f->LongOrderSysID : static_cast<long long>(f->OrderSysID)) << " errorNo=" << f->ErrorNo; log_.error("ERROR", s.str()); }
+		if (validationFailed)log_.warn("VALIDATION", "ignored failed-cancel callback account=" + account + " ref=" + std::to_string(f->OrderRef) + " reason=" + validationReason + " orderSysId=" + systemOrderIdText(f->OrderSysID, f->LongOrderSysID));
+		if (ownedAttempt) { std::ostringstream s; s << "notifyFailedCancelOrder account=" << account << " ref=" << f->OrderRef << " orderSysId=" << systemOrderIdText(f->OrderSysID, f->LongOrderSysID) << " errorNo=" << f->ErrorNo; log_.error("ERROR", s.str()); }
 	}
 	void YdSession::notifyMarketData(const YDMarketData* m) { if (!m)return; { std::lock_guard<std::mutex>lk(mu_); market_[m->InstrumentRef] = *m; marketVersions_[m->InstrumentRef] = ++marketVersion_; cv_.notify_all(); } }
 }

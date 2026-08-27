@@ -19,5 +19,6 @@ int runTest08ErrorMessage(const RunOptions&);
 int runTest09PauseTrade(const RunOptions&);
 int runTest10BatchCancel(const RunOptions&);
 int runTest11Logging(const RunOptions&);
+int runTest13SellAg2610(const RunOptions&);
 int runAllTests(const RunOptions&);
 }
