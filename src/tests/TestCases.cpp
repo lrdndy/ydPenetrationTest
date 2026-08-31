@@ -2072,6 +2072,368 @@ int runTest082NoPosition(const RunOptions& o){return runErrorMessageCase(o,"2.8.
 int runTest083MarketState(const RunOptions& o){return runErrorMessageCase(o,"2.8.3_market_state",ErrorMessageMode::MarketState);}
 int runTest08ErrorMessage(const RunOptions& o){bool known=false;const ErrorMessageMode mode=configuredErrorMode(o,known);if(!known){std::cerr<<"ERROR: use --case no-position|insufficient-funds|market-state"<<std::endl;return 2;}return runErrorMessageCase(o,"2.8_error_message",mode);}
 
+int runTest14ManualPriceOrder(const RunOptions& o){return runEach(o,"14_manual_price_order",[&](const Account&a,const Config&c,Logger&l,TestResult&r){
+    // This test submits one real order at a fixed price without any market-data
+    // subscription. It exists for environments that have no market feed.
+    if(!o.live){r.skip("manual fixed-price order","requires --live; no order sent");return;}
+    const int sessionTimeout=std::max(1,c.getInt("Trade.SessionTimeoutSeconds",120));
+    const int actionTimeout=std::max(1,c.getInt("Trade.ActionTimeoutSeconds",30));
+    YdSession s(o.ydConfig,a.username,a.password,l,true,monitorThresholds(c),o.live);
+    if(!readySessionObserved(s,r,sessionTimeout,a.username))return;
+
+    const std::string requestedInstrument=instID(o,c);
+    const YDInstrument* instrument=s.instrument(requestedInstrument);
+    if(!instrument){r.fail("instrument exists","instrument="+requestedInstrument+"; no order sent");return;}
+    const std::string instrumentId=instrument->InstrumentID;
+    const YDAccount* ydAccount=s.api()?s.api()->getMyAccount():nullptr;
+    if(!ydAccount){r.fail("account identity","getMyAccount returned null; no order sent");return;}
+    const std::string accountId=ydAccount->AccountID[0]?std::string(ydAccount->AccountID):a.username;
+
+    std::string directionText=o.direction;for(auto& ch:directionText)ch=static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    std::string offsetText=o.offset;for(auto& ch:offsetText)ch=static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    const int direction=(directionText=="sell"||directionText=="s")?YD_D_Sell:YD_D_Buy;
+    int offset=YD_OF_Open;
+    if(offsetText=="close"||offsetText=="c")offset=closeOffset(instrument);
+    else if(offsetText=="closetoday"||offsetText=="closetd"||offsetText=="today")offset=YD_OF_CloseToday;
+
+    const int volume=o.orderVolume;
+    if(volume<instrument->MinLimitOrderVolume||volume>instrument->MaxLimitOrderVolume){
+        r.fail("manual order preflight","volume="+std::to_string(volume)+" allowed=["+std::to_string(instrument->MinLimitOrderVolume)+","+std::to_string(instrument->MaxLimitOrderVolume)+"]; no order sent");return;
+    }
+    if(!usablePrice(instrument->Tick)){
+        r.fail("manual order preflight","instrument tick is invalid; no order sent");return;
+    }
+    const double price=legalPrice(o.price,instrument->Tick);
+    if(!usablePrice(price)){
+        r.fail("manual order preflight","price="+snapshotNumber(o.price)+" is not a positive legal price (tick="+snapshotNumber(instrument->Tick)+"); no order sent");return;
+    }
+
+    l.info("SYSTEM","account="+accountId+" event=MANUAL_ORDER source=FIXED_PRICE instrument="+instrumentId
+        +" direction="+directionName(direction)+" offset="+offsetName(offset)
+        +" price="+snapshotNumber(price)+" volume="+std::to_string(volume)
+        +" marketDataRequired=false keepWorking="+(o.keepWorking?std::string("true"):std::string("false")));
+
+    const int orderRef=s.sendLimitOrder(instrument,direction,offset,price,volume);
+    if(orderRef<0){r.fail("manual fixed-price order","insertOrder did not return an OrderRef; check the broker terminal");return;}
+    l.info("TRADE","account="+accountId+" event=MANUAL_ORDER_SUBMITTED instrument="+instrumentId+" orderRef="+std::to_string(orderRef));
+
+    YDOrder state{};
+    if(!s.waitOrder(orderRef,actionTimeout,[](const YDOrder& o){return o.ErrorNo!=0||terminal(o)||o.OrderStatus==YD_OS_Accepted||o.OrderStatus==YD_OS_Queuing;},state)){
+        r.fail("manual fixed-price order","no owned order callback before timeout orderRef="+std::to_string(orderRef)+"; check the broker terminal");return;
+    }
+
+    if(state.ErrorNo!=0){
+        l.info("ORDER_RESULT","account="+accountId+" instrument="+instrumentId+" orderRef="+std::to_string(orderRef)
+            +" direction="+directionName(state.Direction)+" offset="+offsetName(state.OffsetFlag)
+            +" price="+snapshotNumber(state.Price)+" volume="+std::to_string(state.OrderVolume)
+            +" status="+orderStatusName(state.OrderStatus)+" errorNo="+std::to_string(state.ErrorNo));
+        r.fail("manual fixed-price order","cabinet rejected orderRef="+std::to_string(orderRef)+" errorNo="+std::to_string(state.ErrorNo));return;
+    }
+
+    if(o.keepWorking){
+        l.info("ORDER_RESULT","account="+accountId+" instrument="+instrumentId+" orderRef="+std::to_string(orderRef)
+            +" direction="+directionName(state.Direction)+" offset="+offsetName(state.OffsetFlag)
+            +" price="+snapshotNumber(state.Price)+" volume="+std::to_string(state.OrderVolume)
+            +" status="+orderStatusName(state.OrderStatus)+" result=LEFT_WORKING");
+        r.observe("manual fixed-price order","orderRef="+std::to_string(orderRef)+" leftWorking=true; cancel it manually in the broker terminal if needed");
+        return;
+    }
+
+    if(!terminal(state)){
+        if(!s.waitOrder(orderRef,actionTimeout,[](const YDOrder& o){return cancelableOrTerminal(o);},state)){
+            r.fail("manual fixed-price order","order did not become cancelable/terminal orderRef="+std::to_string(orderRef)+"; check the broker terminal");return;
+        }
+    }
+
+    if(terminal(state)){
+        l.info("ORDER_RESULT","account="+accountId+" instrument="+instrumentId+" orderRef="+std::to_string(orderRef)
+            +" direction="+directionName(state.Direction)+" offset="+offsetName(state.OffsetFlag)
+            +" price="+snapshotNumber(state.Price)+" volume="+std::to_string(state.OrderVolume)
+            +" status="+orderStatusName(state.OrderStatus)+" traded="+std::to_string(state.TradeVolume)+"/"+std::to_string(state.OrderVolume));
+        if(state.OrderStatus==YD_OS_AllTraded)
+            r.observe("manual fixed-price order","orderRef="+std::to_string(orderRef)+" filled="+std::to_string(state.TradeVolume)+"; verify position in the broker terminal");
+        else
+            r.observe("manual fixed-price order","orderRef="+std::to_string(orderRef)+" terminal status="+orderStatusName(state.OrderStatus));
+        return;
+    }
+
+    if(!s.cancelOrder(instrument,state)){
+        r.fail("manual fixed-price order","cancelOrder returned false orderRef="+std::to_string(orderRef)+"; check the broker terminal");return;
+    }
+    YDOrder finalOrder{};
+    const int cancelResult=s.waitCancelTerminal(orderRef,actionTimeout,finalOrder);
+    if(cancelResult!=0){
+        r.fail("manual fixed-price order","cancel did not reach terminal orderRef="+std::to_string(orderRef)+" result="+std::to_string(cancelResult)+"; check the broker terminal");return;
+    }
+    l.info("ORDER_RESULT","account="+accountId+" instrument="+instrumentId+" orderRef="+std::to_string(orderRef)
+        +" direction="+directionName(finalOrder.Direction)+" offset="+offsetName(finalOrder.OffsetFlag)
+        +" price="+snapshotNumber(finalOrder.Price)+" volume="+std::to_string(finalOrder.OrderVolume)
+        +" status="+orderStatusName(finalOrder.OrderStatus)+" traded="+std::to_string(finalOrder.TradeVolume)+"/"+std::to_string(finalOrder.OrderVolume));
+    if(finalOrder.OrderStatus==YD_OS_Canceled&&finalOrder.TradeVolume==0)
+        r.pass("manual fixed-price order","orderRef="+std::to_string(orderRef)+" canceled; no residual position");
+    else
+        r.fail("manual fixed-price order","unexpected final status orderRef="+std::to_string(orderRef)+" status="+orderStatusName(finalOrder.OrderStatus)+" traded="+std::to_string(finalOrder.TradeVolume));
+});}
+
+int runTest15ManualBasicTrade(const RunOptions& o){return runEach(o,"15_manual_basic_trade",[&](const Account&a,const Config&c,Logger&l,TestResult&r){
+    // No-market-data variant of the 3.2.2 basic-trade flow: 2 buy-open fills,
+    // 2 buy orders that queue and are canceled, and 2 sell-close fills that
+    // flatten exactly this test's newly opened long position.
+    if(!o.live){r.skip("manual basic trading workflow","requires --live; no order sent");return;}
+    const int sessionTimeout=std::max(1,c.getInt("Trade.SessionTimeoutSeconds",120));
+    const int actionTimeout=std::max(1,c.getInt("Trade.ActionTimeoutSeconds",30));
+    YdSession s(o.ydConfig,a.username,a.password,l,true,monitorThresholds(c),o.live);
+    if(!readySessionObserved(s,r,sessionTimeout,a.username))return;
+
+    const std::string requestedInstrument=instID(o,c);
+    const YDInstrument* instrument=s.instrument(requestedInstrument);
+    if(!instrument){r.fail("instrument exists","instrument="+requestedInstrument+"; no order sent");return;}
+    const std::string instrumentId=instrument->InstrumentID;
+    const YDAccount* ydAccount=s.api()?s.api()->getMyAccount():nullptr;
+    if(!ydAccount){r.fail("account identity","getMyAccount returned null; no order sent");return;}
+    const std::string accountId=ydAccount->AccountID[0]?std::string(ydAccount->AccountID):a.username;
+    const YDAccountInstrumentInfo* accountInstrument=s.api()->getAccountInstrumentInfo(instrument);
+    if(ydAccount->TradingRight!=YD_TR_Allow||!accountInstrument||accountInstrument->TradingRight!=YD_TR_Allow){
+        r.fail("manual basic trade preflight","account/instrument trading right is not ALLOW; no order sent");return;
+    }
+    if(!usablePrice(instrument->Tick)){r.fail("manual basic trade preflight","invalid instrument tick; no order sent");return;}
+    const int volume=o.orderVolume;
+    if(volume<instrument->MinLimitOrderVolume||volume>instrument->MaxLimitOrderVolume){
+        r.fail("manual basic trade preflight","volume="+std::to_string(volume)+" allowed=["+std::to_string(instrument->MinLimitOrderVolume)+","+std::to_string(instrument->MaxLimitOrderVolume)+"]; no order sent");return;
+    }
+    const double openPrice=legalPrice(o.openPrice,instrument->Tick);
+    const double passivePrice=legalPrice(o.passivePrice,instrument->Tick);
+    const double closePrice=legalPrice(o.closePrice,instrument->Tick);
+    if(!usablePrice(openPrice)||!usablePrice(passivePrice)||!usablePrice(closePrice)){
+        r.fail("manual basic trade preflight","open/passive/close price must be positive legal prices (tick="+snapshotNumber(instrument->Tick)+"); no order sent");return;
+    }
+
+    LongPositionSnapshot baselinePosition;
+    if(!queryLongSpeculationPosition(s.extendedApi(),ydAccount,instrument,baselinePosition)){
+        r.fail("manual basic trade preflight","cannot query baseline long position; no order sent");return;
+    }
+    l.info("POSITION_BASELINE","account="+accountId+" snapshotTime="+timestampText()+" instrument="+instrumentId+" direction=LONG hedge=SPECULATION today="+std::to_string(baselinePosition.today)+" history="+std::to_string(baselinePosition.history)+" other="+std::to_string(baselinePosition.other)+" total="+std::to_string(baselinePosition.total()));
+
+    l.info("SYSTEM","account="+accountId+" event=MANUAL_BASIC_TRADE instrument="+instrumentId
+        +" volume="+std::to_string(volume)+" openPrice="+snapshotNumber(openPrice)
+        +" passivePrice="+snapshotNumber(passivePrice)+" closePrice="+snapshotNumber(closePrice)
+        +" marketDataRequired=false");
+
+    struct Ticket{int ref=0;int direction=YD_D_Buy;int offset=YD_OF_Open;double price=0;int volume=0;};
+    std::vector<Ticket> tickets;
+    int openFills=0,cancellations=0,closeFills=0;
+    int passiveFilledVolume=0;
+    std::string firstFailure;
+    auto fail=[&](const std::string& text){if(firstFailure.empty())firstFailure=text;l.error("ORDER_RESULT",text);};
+
+    // Phase 1: two buy-open fills.
+    for(int seq=1;seq<=2;++seq){
+        const int ref=s.sendLimitOrder(instrument,YD_D_Buy,YD_OF_Open,openPrice,volume);
+        if(ref<0){fail("OPEN #"+std::to_string(seq)+" insertOrder returned false");break;}
+        tickets.push_back({ref,YD_D_Buy,YD_OF_Open,openPrice,volume});
+        YDOrder od{};
+        if(!s.waitOrder(ref,actionTimeout,terminal,od)){fail("OPEN #"+std::to_string(seq)+" terminal callback timeout ref="+std::to_string(ref));break;}
+        if(od.ErrorNo!=0||od.OrderStatus!=YD_OS_AllTraded||od.TradeVolume!=volume){fail("OPEN #"+std::to_string(seq)+" unexpected state ref="+std::to_string(ref)+" status="+orderStatusName(od.OrderStatus)+" errorNo="+std::to_string(od.ErrorNo)+" traded="+std::to_string(od.TradeVolume)+"/"+std::to_string(volume));break;}
+        ++openFills;
+        l.info("ORDER_RESULT","OPEN #"+std::to_string(seq)+" | account="+accountId+" | instrument="+instrumentId+" | direction=BUY | offset=OPEN | orderPrice="+snapshotNumber(od.Price)+" | volume="+std::to_string(od.OrderVolume)+" | filled="+std::to_string(od.TradeVolume)+"/"+std::to_string(od.OrderVolume)+" | orderRef="+std::to_string(ref)+" | status="+orderStatusName(od.OrderStatus)+" | errorNo=0 | resultTime="+timestampText());
+    }
+
+    // Phase 2: two buy orders that queue, then cancel each.
+    if(openFills==2){
+        for(int seq=1;seq<=2;++seq){
+            const int ref=s.sendLimitOrder(instrument,YD_D_Buy,YD_OF_Open,passivePrice,volume);
+            if(ref<0){fail("CANCEL #"+std::to_string(seq)+" insertOrder returned false");break;}
+            tickets.push_back({ref,YD_D_Buy,YD_OF_Open,passivePrice,volume});
+            YDOrder working{};
+            if(!s.waitOrder(ref,actionTimeout,cancelableOrTerminal,working)){fail("CANCEL #"+std::to_string(seq)+" did not become cancelable/terminal ref="+std::to_string(ref));break;}
+            if(working.ErrorNo!=0){fail("CANCEL #"+std::to_string(seq)+" rejected ref="+std::to_string(ref)+" errorNo="+std::to_string(working.ErrorNo));break;}
+            if(terminal(working)){
+                if(working.OrderStatus==YD_OS_AllTraded){
+                    passiveFilledVolume+=working.TradeVolume;
+                    l.warn("ORDER_RESULT","CANCEL #"+std::to_string(seq)+" passive order unexpectedly filled ref="+std::to_string(ref)+" traded="+std::to_string(working.TradeVolume)+"/"+std::to_string(working.OrderVolume)+"; will be flattened in the close phase");
+                    continue;
+                }
+                ++cancellations;continue;
+            }
+            if(working.OrderStatus!=YD_OS_Queuing){fail("CANCEL #"+std::to_string(seq)+" did not remain queuing ref="+std::to_string(ref)+" status="+orderStatusName(working.OrderStatus)+" traded="+std::to_string(working.TradeVolume));break;}
+            if(!hasAssignedSystemOrderId(working.OrderSysID,working.LongOrderSysID)){fail("CANCEL #"+std::to_string(seq)+" queued order has no system order ID ref="+std::to_string(ref));break;}
+            if(!s.cancelOrder(instrument,working)){fail("CANCEL #"+std::to_string(seq)+" cancelOrder returned false ref="+std::to_string(ref));break;}
+            YDOrder final{};
+            const int cr=s.waitCancelTerminal(ref,actionTimeout,final);
+            if(cr!=0){fail("CANCEL #"+std::to_string(seq)+" cancel did not reach terminal ref="+std::to_string(ref)+" result="+std::to_string(cr));break;}
+            if(final.OrderStatus!=YD_OS_Canceled||final.TradeVolume!=0){fail("CANCEL #"+std::to_string(seq)+" unexpected final ref="+std::to_string(ref)+" status="+orderStatusName(final.OrderStatus)+" traded="+std::to_string(final.TradeVolume));break;}
+            ++cancellations;
+            l.info("ORDER_RESULT","CANCEL #"+std::to_string(seq)+" | account="+accountId+" | instrument="+instrumentId+" | direction=BUY | offset=OPEN | orderPrice="+snapshotNumber(final.Price)+" | volume="+std::to_string(final.OrderVolume)+" | filled=0/"+std::to_string(final.OrderVolume)+" | orderRef="+std::to_string(ref)+" | status="+orderStatusName(final.OrderStatus)+" | errorNo=0 | resultTime="+timestampText());
+        }
+    }
+
+    // Phase 3: sell-close exactly this test's net long (2 opens plus any surprise passive fill).
+    int remainingLongs=openFills*volume+passiveFilledVolume;
+    int closeSeq=0;
+    while(remainingLongs>0){
+        const int closeVol=std::min(remainingLongs,volume);
+        const int offset=closeOffset(instrument);
+        const int ref=s.sendLimitOrder(instrument,YD_D_Sell,offset,closePrice,closeVol);
+        ++closeSeq;
+        if(ref<0){fail("CLOSE #"+std::to_string(closeSeq)+" insertOrder returned false");break;}
+        tickets.push_back({ref,YD_D_Sell,offset,closePrice,closeVol});
+        YDOrder od{};
+        if(!s.waitOrder(ref,actionTimeout,terminal,od)){fail("CLOSE #"+std::to_string(closeSeq)+" terminal callback timeout ref="+std::to_string(ref));break;}
+        if(od.ErrorNo!=0){fail("CLOSE #"+std::to_string(closeSeq)+" rejected ref="+std::to_string(ref)+" errorNo="+std::to_string(od.ErrorNo));break;}
+        if(od.OrderStatus==YD_OS_AllTraded&&od.TradeVolume==closeVol){
+            ++closeFills;remainingLongs-=od.TradeVolume;
+            l.info("ORDER_RESULT","CLOSE #"+std::to_string(closeSeq)+" | account="+accountId+" | instrument="+instrumentId+" | direction=SELL | offset="+offsetName(offset)+" | orderPrice="+snapshotNumber(od.Price)+" | volume="+std::to_string(od.OrderVolume)+" | filled="+std::to_string(od.TradeVolume)+"/"+std::to_string(od.OrderVolume)+" | orderRef="+std::to_string(ref)+" | status="+orderStatusName(od.OrderStatus)+" | errorNo=0 | resultTime="+timestampText());
+        }else{
+            fail("CLOSE #"+std::to_string(closeSeq)+" did not fully fill ref="+std::to_string(ref)+" status="+orderStatusName(od.OrderStatus)+" traded="+std::to_string(od.TradeVolume)+"/"+std::to_string(closeVol));
+            if(!terminal(od)&&hasAssignedSystemOrderId(od.OrderSysID,od.LongOrderSysID)&&s.cancelOrder(instrument,od)){YDOrder fo{};s.waitCancelTerminal(ref,actionTimeout,fo);}
+            break;
+        }
+    }
+
+    // Defensive cleanup: cancel any of this test's orders still working.
+    bool anyWorking=false;
+    const OrderStreamSnapshot snap=s.orderStreamSnapshot();
+    for(const Ticket& t:tickets){
+        const auto it=snap.orders.find(t.ref);
+        if(it==snap.orders.end())continue;
+        if(terminal(it->second))continue;
+        anyWorking=true;
+        if(hasAssignedSystemOrderId(it->second.OrderSysID,it->second.LongOrderSysID)&&s.cancelOrder(instrument,it->second)){
+            YDOrder fo{};s.waitCancelTerminal(t.ref,actionTimeout,fo);
+        }
+    }
+
+    LongPositionSnapshot finalPosition;
+    const bool positionKnown=queryLongSpeculationPosition(s.extendedApi(),ydAccount,instrument,finalPosition);
+    const bool positionRestored=positionKnown&&finalPosition.total()==baselinePosition.total();
+    l.info("POSITION_VERIFY","account="+accountId+" snapshotTime="+timestampText()+" instrument="+instrumentId
+        +" baselineToday="+std::to_string(baselinePosition.today)+" finalToday="+std::to_string(finalPosition.today)
+        +" baselineHistory="+std::to_string(baselinePosition.history)+" finalHistory="+std::to_string(finalPosition.history)
+        +" baselineOther="+std::to_string(baselinePosition.other)+" finalOther="+std::to_string(finalPosition.other)
+        +" baselineTotal="+std::to_string(baselinePosition.total())+" finalTotal="+std::to_string(finalPosition.total())
+        +" quantityRestored="+(positionRestored?std::string("true"):std::string("false")));
+
+    const bool succeeded=openFills==2&&cancellations==2&&remainingLongs==0&&positionRestored&&!anyWorking;
+    if(succeeded)r.pass("manual basic trading workflow","account="+accountId+" instrument="+instrumentId+" openFills=2 cancellations=2 closeFills="+std::to_string(closeFills)+" baselineTotal="+std::to_string(baselinePosition.total())+" finalTotal="+std::to_string(finalPosition.total())+" noWorkingOrders=true");
+    else{
+        if(!positionRestored)l.error("ALERT","MANUAL ACTION REQUIRED account="+accountId+" instrument="+instrumentId+"; verify working orders and positions in the broker terminal");
+        r.fail("manual basic trading workflow","account="+accountId+" instrument="+instrumentId+" openFills="+std::to_string(openFills)+"/2 cancellations="+std::to_string(cancellations)+"/2 closeFills="+std::to_string(closeFills)+" remainingLongs="+std::to_string(remainingLongs)+" positionRestored="+(positionRestored?std::string("true"):std::string("false"))+" noWorkingOrders="+(!anyWorking?std::string("true"):std::string("false"))+(firstFailure.empty()?std::string():(" firstFailure="+firstFailure)));
+    }
+},true,false);}
+
+int runTest16ManualOrderCount(const RunOptions& o){return runEach(o,"16_manual_order_count",[&](const Account&a,const Config&c,Logger&l,TestResult&r){
+    // No-market-data variant of the 3.3.1.2 order/cancel count monitoring:
+    // submit N passive buy orders at a fixed price, cancel each after it queues,
+    // and report the same COUNT_RESULT counters without any market subscription.
+    if(!o.live){r.skip("manual order/cancel count monitoring","requires --live; no order sent");return;}
+    const int sessionTimeout=std::max(1,c.getInt("Trade.SessionTimeoutSeconds",120));
+    const int actionTimeout=std::max(1,c.getInt("Trade.ActionTimeoutSeconds",30));
+    YdSession s(o.ydConfig,a.username,a.password,l,true,monitorThresholds(c),o.live);
+    if(!readySessionObserved(s,r,sessionTimeout,a.username))return;
+
+    const std::string requestedInstrument=instID(o,c);
+    const YDInstrument* instrument=s.instrument(requestedInstrument);
+    if(!instrument){r.fail("instrument exists","instrument="+requestedInstrument+"; no order sent");return;}
+    const std::string instrumentId=instrument->InstrumentID;
+    const YDAccount* ydAccount=s.api()?s.api()->getMyAccount():nullptr;
+    if(!ydAccount){r.fail("account identity","getMyAccount returned null; no order sent");return;}
+    const std::string accountId=ydAccount->AccountID[0]?std::string(ydAccount->AccountID):a.username;
+    const YDAccountInstrumentInfo* accountInstrument=s.api()->getAccountInstrumentInfo(instrument);
+    if(ydAccount->TradingRight!=YD_TR_Allow||!accountInstrument||accountInstrument->TradingRight!=YD_TR_Allow){
+        r.fail("manual order count preflight","account/instrument trading right is not ALLOW; no order sent");return;
+    }
+    if(!usablePrice(instrument->Tick)){r.fail("manual order count preflight","invalid instrument tick; no order sent");return;}
+    const int volume=o.orderVolume;
+    if(volume<instrument->MinLimitOrderVolume||volume>instrument->MaxLimitOrderVolume){
+        r.fail("manual order count preflight","volume="+std::to_string(volume)+" allowed=["+std::to_string(instrument->MinLimitOrderVolume)+","+std::to_string(instrument->MaxLimitOrderVolume)+"]; no order sent");return;
+    }
+    const int requiredCount=std::max(1,o.count);
+    const double price=legalPrice(o.countPrice,instrument->Tick);
+    if(!usablePrice(price)){
+        r.fail("manual order count preflight","count-price="+snapshotNumber(o.countPrice)+" is not a positive legal price (tick="+snapshotNumber(instrument->Tick)+"); no order sent");return;
+    }
+
+    l.info("SYSTEM","account="+accountId+" event=MANUAL_ORDER_COUNT instrument="+instrumentId
+        +" volume="+std::to_string(volume)+" count="+std::to_string(requiredCount)
+        +" price="+snapshotNumber(price)+" marketDataRequired=false");
+
+    const OrderActivitySnapshot activityStart=s.orderActivity();
+    int submittedCount=0,cancelledCount=0;
+    std::vector<int> workingRefs;
+    bool anyFailure=false;
+    std::string firstFailure;
+    auto fail=[&](const std::string& text){anyFailure=true;if(firstFailure.empty())firstFailure=text;l.error("ORDER_RESULT",text);};
+
+    for(int seq=1;seq<=requiredCount;++seq){
+        const int ref=s.sendLimitOrder(instrument,YD_D_Buy,YD_OF_Open,price,volume);
+        if(ref<0){fail("ORDER #"+std::to_string(seq)+" insertOrder returned false");break;}
+        workingRefs.push_back(ref);
+        YDOrder working{};
+        if(!s.waitOrder(ref,actionTimeout,cancelableOrTerminal,working)){fail("ORDER #"+std::to_string(seq)+" did not become cancelable/terminal ref="+std::to_string(ref));break;}
+        if(working.ErrorNo!=0){fail("ORDER #"+std::to_string(seq)+" rejected ref="+std::to_string(ref)+" errorNo="+std::to_string(working.ErrorNo));break;}
+        if(terminal(working)){
+            if(working.OrderStatus==YD_OS_AllTraded){
+                fail("ORDER #"+std::to_string(seq)+" unexpectedly filled ref="+std::to_string(ref)+" traded="+std::to_string(working.TradeVolume)+"/"+std::to_string(volume)+"; lower --count-price so the order queues instead");
+            }
+            break;
+        }
+        if(working.OrderStatus!=YD_OS_Queuing){fail("ORDER #"+std::to_string(seq)+" did not remain queuing ref="+std::to_string(ref)+" status="+orderStatusName(working.OrderStatus)+" traded="+std::to_string(working.TradeVolume));break;}
+        if(!hasAssignedSystemOrderId(working.OrderSysID,working.LongOrderSysID)){fail("ORDER #"+std::to_string(seq)+" queued order has no system order ID ref="+std::to_string(ref));break;}
+        if(!s.cancelOrder(instrument,working)){fail("ORDER #"+std::to_string(seq)+" cancelOrder returned false ref="+std::to_string(ref));break;}
+        YDOrder final{};
+        const int cr=s.waitCancelTerminal(ref,actionTimeout,final);
+        if(cr!=0){fail("ORDER #"+std::to_string(seq)+" cancel did not reach terminal ref="+std::to_string(ref)+" result="+std::to_string(cr));break;}
+        if(final.OrderStatus!=YD_OS_Canceled||final.TradeVolume!=0){fail("ORDER #"+std::to_string(seq)+" unexpected final ref="+std::to_string(ref)+" status="+orderStatusName(final.OrderStatus)+" traded="+std::to_string(final.TradeVolume));break;}
+        ++cancelledCount;
+        l.info("ORDER_RESULT","ORDER #"+std::to_string(seq)+"/"+std::to_string(requiredCount)+" | account="+accountId+" | instrument="+instrumentId+" | direction=BUY | offset=OPEN | orderPrice="+snapshotNumber(final.Price)+" | volume="+std::to_string(final.OrderVolume)+" | filled=0/"+std::to_string(final.OrderVolume)+" | orderRef="+std::to_string(ref)+" | status="+orderStatusName(final.OrderStatus)+" | errorNo=0 | resultTime="+timestampText());
+    }
+
+    // Defensive cleanup: cancel any of this test's orders still working.
+    bool anyWorking=false;
+    const OrderStreamSnapshot snap=s.orderStreamSnapshot();
+    for(const int ref:workingRefs){
+        const auto it=snap.orders.find(ref);
+        if(it==snap.orders.end())continue;
+        if(terminal(it->second))continue;
+        anyWorking=true;
+        if(hasAssignedSystemOrderId(it->second.OrderSysID,it->second.LongOrderSysID)&&s.cancelOrder(instrument,it->second)){
+            YDOrder fo{};s.waitCancelTerminal(ref,actionTimeout,fo);
+        }
+    }
+
+    const OrderActivitySnapshot activityEnd=s.orderActivity();
+    const OrderActivitySnapshot measuredActivity=activityDelta(activityEnd,activityStart);
+    const bool monitoringPass=!anyFailure&&cancelledCount==requiredCount
+        &&measuredActivity.orderApiRequests==requiredCount
+        &&measuredActivity.orderRequestsSubmitted==requiredCount
+        &&measuredActivity.uniqueAcceptedOrders==requiredCount
+        &&measuredActivity.cancelApiRequests==requiredCount
+        &&measuredActivity.cancelRequestsSubmitted==requiredCount
+        &&measuredActivity.confirmedCancellations==requiredCount
+        &&measuredActivity.failedCancelCallbacks==0
+        &&measuredActivity.callbackValidationFailures==0
+        &&!anyWorking;
+
+    std::ostringstream line;line<<"status="<<(monitoringPass?"PASS":"FAIL")<<" | account="<<accountId<<" | countTime="<<timestampText()<<" | instrument="<<instrumentId
+        <<" | orderApiRequests="<<measuredActivity.orderApiRequests
+        <<" | orderRequestsSubmitted="<<measuredActivity.orderRequestsSubmitted
+        <<" | uniqueAcceptedOrders="<<measuredActivity.uniqueAcceptedOrders
+        <<" | cancelApiRequests="<<measuredActivity.cancelApiRequests
+        <<" | cancelRequestsSubmitted="<<measuredActivity.cancelRequestsSubmitted
+        <<" | confirmedCancellations="<<measuredActivity.confirmedCancellations
+        <<" | failedCancelCallbacks="<<measuredActivity.failedCancelCallbacks
+        <<" | callbackValidationFailures="<<measuredActivity.callbackValidationFailures
+        <<" | totalOrderApiRequests="<<measuredActivity.orderApiRequests
+        <<" | totalAcceptedOrders="<<measuredActivity.uniqueAcceptedOrders
+        <<" | totalCancelApiRequests="<<measuredActivity.cancelApiRequests
+        <<" | totalConfirmedCancellations="<<measuredActivity.confirmedCancellations
+        <<" | noWorkingOrders="<<(!anyWorking?std::string("true"):std::string("false"));
+    if(monitoringPass)l.info("COUNT_RESULT",line.str());else l.error("COUNT_RESULT",line.str());
+
+    if(monitoringPass)r.pass("manual order/cancel count monitoring","account="+accountId+" instrument="+instrumentId+" orderApiRequests="+std::to_string(measuredActivity.orderApiRequests)+" confirmedCancellations="+std::to_string(measuredActivity.confirmedCancellations));
+    else r.fail("manual order/cancel count monitoring",line.str());
+},true,false);}
+
 int runTest09PauseTrade(const RunOptions& o){return runEach(o,"2.9_pause_trade",[&](const Account&a,const Config&c,Logger&l,TestResult&r){
     if(o.live){r.fail("trading control safety","test_09 does not accept --live; no order sent");return;}
     const int sessionTimeout=std::max(1,c.getInt("Trade.SessionTimeoutSeconds",120));

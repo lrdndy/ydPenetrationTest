@@ -1,0 +1,17 @@
+# Local SYBW (易达仿真/看穿式监管仿真) environment. Contains credentials; git-ignored.
+# No market-data feed is available in this environment; trading is on 51000(SHFE).
+# Orders that require a price must use a configured legal price (see test_config.ini ErrorTest.OrderPrice).
+RecoverySiteCount=0
+TradingServerIP=106.37.101.162
+TradingServerPort=51000
+TradingProtocol=TCP
+TCPTradingCPUID=-1
+XTCPTradingCPUID=-1
+TradingServerTimeout=10
+RecalcMode=off
+TimerCPUID=-1
+ConnectTCPMarketData=no
+ReceiveUDPMarketData=no
+AppID=client_SYBW_1.0.0
+AuthCode=YHQHYHQHYHQHYHQH
+LogDir=log

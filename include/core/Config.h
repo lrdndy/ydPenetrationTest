@@ -29,6 +29,19 @@ struct RunOptions {
     std::string caseName;
     std::string logDate;
     std::string outputRoot = "output";
+    // Manual fixed-price order (test_14) — no market data required.
+    double price = 0.0;
+    int orderVolume = 1;
+    std::string direction = "buy";
+    std::string offset = "open";
+    bool keepWorking = false;
+    // Manual basic-trade workflow (test_15) — no market data required.
+    double openPrice = 0.0;
+    double passivePrice = 0.0;
+    double closePrice = 0.0;
+    // Manual order/cancel count monitoring (test_16) — no market data required.
+    double countPrice = 0.0;
+    int count = 2;
     bool live = false;
     bool allowExistingTodayPosition = false;
     bool interactive = false;

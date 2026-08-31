@@ -82,6 +82,14 @@ public:
     BatchCancelActivitySnapshot batchCancelActivity() const;
     InstructionValidationSnapshot instructionValidation() const;
     OrderStreamSnapshot orderStreamSnapshot() const;
+    struct HistoricalCallbackCounts {
+        std::uint64_t order = 0;
+        std::uint64_t trade = 0;
+        std::uint64_t cancel = 0;
+        std::uint64_t rejected = 0;
+    };
+    HistoricalCallbackCounts historicalCallbackCounts() const;
+    HistoricalCallbackCounts historicalCallbackCounts(const std::string& instrumentId) const;
     bool waitOrderActivityQuiet(int quietMilliseconds,int maxSeconds,OrderStreamSnapshot& out);
     bool stopIfOrderStreamUnchanged(std::uint64_t activityGeneration,std::uint64_t sessionGeneration,OrderStreamSnapshot& out);
     bool waitMarketData(int instrumentRef, int sec, YDMarketData& out);
@@ -184,6 +192,8 @@ private:
     std::uint64_t eventGeneration_=0,tradeConnectedGeneration_=0,tradeDisconnectedGeneration_=0,loginGeneration_=0,caughtUpGeneration_=0;
     std::string tradeConnectedTime_,tradeDisconnectedTime_,loginTime_,caughtUpTime_;
     std::size_t historicalOrderCallbacks_=0,historicalTradeCallbacks_=0;
+    std::size_t historicalCancelCallbacks_=0,historicalRejectedCallbacks_=0;
+    std::unordered_map<std::string,HistoricalCallbackCounts> historicalByInstrument_;
     std::unordered_map<int,YDMarketData> market_;
     std::unordered_map<int,std::uint64_t> marketVersions_;
     std::uint64_t marketVersion_=0;

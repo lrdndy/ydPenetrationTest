@@ -71,6 +71,16 @@ RunOptions parseArgs(int argc, char** argv) {
         else if (a == "--case") o.caseName = next();
         else if (a == "--log-date") o.logDate = next();
         else if (a == "--output") o.outputRoot = next();
+        else if (a == "--price") o.price = std::stod(next());
+        else if (a == "--volume") o.orderVolume = std::stoi(next());
+        else if (a == "--direction") o.direction = next();
+        else if (a == "--offset") o.offset = next();
+        else if (a == "--keep-working") o.keepWorking = true;
+        else if (a == "--open-price") o.openPrice = std::stod(next());
+        else if (a == "--passive-price") o.passivePrice = std::stod(next());
+        else if (a == "--close-price") o.closePrice = std::stod(next());
+        else if (a == "--count-price") o.countPrice = std::stod(next());
+        else if (a == "--count") o.count = std::stoi(next());
         else if (a == "--live") o.live = true;
         else if (a == "--allow-existing-today-position") o.allowExistingTodayPosition = true;
         else if (a == "--interactive") o.interactive = true;
@@ -87,6 +97,16 @@ void printCommonUsage(const char* exe) {
               << "  --accounts <csv>        username,password,label CSV\n"
               << "  --instrument <id>       Override test instrument\n"
               << "  --case <name>            Error-message test case\n"
+              << "  --price <p>              test_14 fixed order price (no market data)\n"
+              << "  --volume <n>             test_14/15 order volume (default 1)\n"
+              << "  --direction buy|sell     test_14 direction (default buy)\n"
+              << "  --offset open|close      test_14 offset (default open)\n"
+              << "  --keep-working           test_14 leave the order working instead of canceling\n"
+              << "  --open-price <p>         test_15 buy-open price (fills)\n"
+              << "  --passive-price <p>      test_15 buy price (queues, then canceled)\n"
+              << "  --close-price <p>        test_15 sell-close price (flattens the test longs)\n"
+              << "  --count-price <p>        test_16 passive buy price (queues, then canceled)\n"
+              << "  --count <n>              test_16 number of orders to count (default 2)\n"
               << "  --log-date <YYYYMMDD>    Session-start date for the logging archive audit\n"
               << "  --output <dir>           Output root\n"
               << "  --live                   Allow real order/cancel requests\n"

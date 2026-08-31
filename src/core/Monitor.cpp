@@ -122,6 +122,16 @@ void Monitor::logThresholdConfiguration() {
         + " popupEnabled=" + (thresholds_.popupEnabled ? std::string("true") : std::string("false")));
 }
 
+void Monitor::alertOnTodayCounts(std::uint64_t orderTotal, std::uint64_t cancelTotal) {
+    logThresholdConfiguration();
+    if (thresholds_.orderCount > 0 && orderTotal >= static_cast<std::uint64_t>(thresholds_.orderCount)) {
+        emitAlert("ORDER_COUNT_THRESHOLD", static_cast<int>(orderTotal), thresholds_.orderCount);
+    }
+    if (thresholds_.cancelCount > 0 && cancelTotal >= static_cast<std::uint64_t>(thresholds_.cancelCount)) {
+        emitAlert("CANCEL_COUNT_THRESHOLD", static_cast<int>(cancelTotal), thresholds_.cancelCount);
+    }
+}
+
 void Monitor::logRiskStatistics() const {
     log_.info("MONITOR", "account=" + account_
         + " event=RISK_STATISTICS"

@@ -94,6 +94,8 @@ namespace ydtest {
 	bool YdSession::waitLoginAfter(std::uint64_t generation, int s) { return waitState(s, [&] {return loginGeneration_ > generation; }); }
 	bool YdSession::waitCaughtUpAfter(std::uint64_t generation, int s) { return waitState(s, [&] {return caughtUpGeneration_ > generation; }); }
 	OrderActivitySnapshot YdSession::orderActivity() const { std::lock_guard<std::mutex> lk(mu_); return { orderApiRequests_,orderRequestsSubmitted_,acceptedOrderRefs_.size(),cancelApiRequests_,cancelRequestsSubmitted_,confirmedCancellations_,failedCancelCallbacks_,callbackValidationFailures_ }; }
+	YdSession::HistoricalCallbackCounts YdSession::historicalCallbackCounts() const { std::lock_guard<std::mutex> lk(mu_); return { historicalOrderCallbacks_,historicalTradeCallbacks_,historicalCancelCallbacks_,historicalRejectedCallbacks_ }; }
+	YdSession::HistoricalCallbackCounts YdSession::historicalCallbackCounts(const std::string& instrumentId) const { std::lock_guard<std::mutex> lk(mu_); const auto it = historicalByInstrument_.find(instrumentId); return it == historicalByInstrument_.end() ? HistoricalCallbackCounts{} : it->second; }
 	BatchCancelActivitySnapshot YdSession::batchCancelActivity() const { std::lock_guard<std::mutex> lk(mu_); return { batchCancelApiCalls_,batchCancelApiCallsSubmitted_,batchCancelOrdersRequested_,batchCancelOrdersSubmitted_ }; }
 	InstructionValidationSnapshot YdSession::instructionValidation() const { std::lock_guard<std::mutex> lk(mu_); return { invalidInstrumentInstructions_,invalidLimitPriceInstructions_,invalidLimitVolumeInstructions_ }; }
 	OrderStreamSnapshot YdSession::orderStreamSnapshotLocked() const {
@@ -408,7 +410,7 @@ namespace ydtest {
 			if (e == YD_AE_TCPTradeConnected) {
 				connected_ = true; tradeConnectedGeneration_ = generation; tradeConnectedTime_ = eventTime; channel = "TRADE"; state = tradeDisconnectedGeneration_ == 0 ? "NORMAL" : "RECONNECTED";
 			} else if (e == YD_AE_TCPTradeDisconnected) {
-				connected_ = false; disconnectedSeen_ = true; loginDone_ = false; loginError_ = -999; caughtUp_ = false; tradeDisconnectedGeneration_ = generation; tradeDisconnectedTime_ = eventTime; historicalOrderCallbacks_ = 0; historicalTradeCallbacks_ = 0; channel = "TRADE"; state = "ABNORMAL";
+				connected_ = false; disconnectedSeen_ = true; loginDone_ = false; loginError_ = -999; caughtUp_ = false; tradeDisconnectedGeneration_ = generation; tradeDisconnectedTime_ = eventTime; historicalOrderCallbacks_ = 0; historicalTradeCallbacks_ = 0; historicalCancelCallbacks_ = 0; historicalRejectedCallbacks_ = 0; historicalByInstrument_.clear(); channel = "TRADE"; state = "ABNORMAL";
 			} else if (e == YD_AE_TCPMarketDataConnected) { channel = "MARKET_DATA"; state = "CONNECTED";
 			} else if (e == YD_AE_TCPMarketDataDisconnected) { channel = "MARKET_DATA"; state = "DISCONNECTED"; }
 			cv_.notify_all();
@@ -461,7 +463,7 @@ namespace ydtest {
 	void YdSession::notifyCaughtUp() { const std::string caughtUpTime = timestampText(); std::size_t orderCount = 0, tradeCount = 0; std::uint64_t generation = 0; { std::lock_guard<std::mutex>lk(mu_); caughtUp_ = true; caughtUpTime_ = caughtUpTime; generation = caughtUpGeneration_ = ++eventGeneration_; orderCount = historicalOrderCallbacks_; tradeCount = historicalTradeCallbacks_; cv_.notify_all(); } log_.info("SYSTEM", "notifyCaughtUp: history caught up account=" + username_ + " caughtUpTime=" + caughtUpTime + " generation=" + std::to_string(generation) + " historicalOrderCallbacks=" + std::to_string(orderCount) + " historicalTradeCallbacks=" + std::to_string(tradeCount)); }
 	void YdSession::notifyOrder(const YDOrder* o, const YDInstrument* i, const YDAccount* a) {
 		if (!o)return; bool shouldLog = false, validationFailed = false, newlyAccepted = false, newlyConfirmed = false; std::string validationReason; std::uint64_t acceptedCount = 0, confirmedCount = 0;
-		{ std::lock_guard<std::mutex>lk(mu_); const std::uint64_t callbackGeneration = ++orderCallbackGeneration_; if (!caughtUp_)++historicalOrderCallbacks_;
+		{ std::lock_guard<std::mutex>lk(mu_); const std::uint64_t callbackGeneration = ++orderCallbackGeneration_; if (!caughtUp_) { ++historicalOrderCallbacks_; if (o->ErrorNo != 0)++historicalRejectedCallbacks_; else if (o->OrderStatus == YD_OS_Canceled)++historicalCancelCallbacks_; if (i && i->InstrumentID[0]) { HistoricalCallbackCounts& per = historicalByInstrument_[i->InstrumentID]; ++per.order; if (o->ErrorNo != 0)++per.rejected; else if (o->OrderStatus == YD_OS_Canceled)++per.cancel; } }
 			auto found = ownedOrders_.find(o->OrderRef);
 			if (found != ownedOrders_.end()) {
 				OwnedOrderState& state = found->second; shouldLog = true; ++orderActivityGeneration_;
@@ -508,7 +510,7 @@ namespace ydtest {
 	}
 	void YdSession::notifyTrade(const YDTrade* t, const YDInstrument* i, const YDAccount* a) {
 		if (!t)return; bool shouldLog = false, validationFailed = false; std::string validationReason;
-		{ std::lock_guard<std::mutex>lk(mu_); trades_.push_back(*t); if (!caughtUp_)++historicalTradeCallbacks_;
+		{ std::lock_guard<std::mutex>lk(mu_); trades_.push_back(*t); if (!caughtUp_) { ++historicalTradeCallbacks_; if (i && i->InstrumentID[0]) { ++historicalByInstrument_[i->InstrumentID].trade; } }
 			auto found = ownedOrders_.find(t->OrderRef);
 			if (found != ownedOrders_.end()) {
 				const OwnedOrderState& state = found->second; ++orderActivityGeneration_; const long long incomingSys = static_cast<long long>(t->OrderSysID), incomingLongSys = static_cast<long long>(t->LongOrderSysID);

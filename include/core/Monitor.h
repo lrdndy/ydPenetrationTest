@@ -41,6 +41,11 @@ public:
     void logThresholdConfiguration();
     void logRiskStatistics() const;
     void logDuplicateStatistics() const;
+    // Compare today's externally-provided order/cancel totals against the
+    // configured thresholds and emit the matching ALERT records. Used by the
+    // read-only today-count tool (test_17), which does not feed incremental
+    // instructions into this monitor.
+    void alertOnTodayCounts(std::uint64_t orderTotal, std::uint64_t cancelTotal);
     int orderCount() const { return orderCount_; }
     int cancelCount() const { return cancelCount_; }
     int duplicateCount() const { return duplicateCount_; }
