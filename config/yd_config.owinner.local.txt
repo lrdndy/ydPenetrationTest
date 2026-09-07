@@ -1,0 +1,19 @@
+# Local Owinner (中泰期货易达仿真 / 看穿式前置) environment. Contains credentials; git-ignored.
+RecoverySiteCount=0
+TradingServerIP=119.188.3.11
+TradingServerPort=40000
+TradingProtocol=TCP
+TCPTradingCPUID=-1
+XTCPTradingCPUID=-1
+TradingServerTimeout=10
+RecalcMode=off
+TimerCPUID=-1
+ConnectTCPMarketData=yes
+TCPMarketDataServerIP=119.188.3.11
+TCPMarketDataServerPort=40001
+TCPMarketDataTimeout=10
+TCPMarketDataCPUID=-1
+ReceiveUDPMarketData=no
+AppID=client_Owinner_1.0.0
+AuthCode=d6718a6931968adb912837db624ae226
+LogDir=log

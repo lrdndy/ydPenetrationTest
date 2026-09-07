@@ -55,6 +55,7 @@ struct InstructionValidationSnapshot {
     std::uint64_t invalidInstrument=0;
     std::uint64_t invalidLimitPrice=0;
     std::uint64_t invalidLimitVolume=0;
+    std::uint64_t invalidPriceRange=0;
 };
 
 struct TradingControlSnapshot {
@@ -187,7 +188,7 @@ private:
     std::uint64_t batchCancelOrdersRequested_=0,batchCancelOrdersSubmitted_=0;
     std::uint64_t confirmedCancellations_=0,failedCancelCallbacks_=0;
     std::uint64_t callbackValidationFailures_=0,orderActivityGeneration_=0;
-    std::uint64_t invalidInstrumentInstructions_=0,invalidLimitPriceInstructions_=0,invalidLimitVolumeInstructions_=0;
+    std::uint64_t invalidInstrumentInstructions_=0,invalidLimitPriceInstructions_=0,invalidLimitVolumeInstructions_=0,invalidPriceRangeInstructions_=0;
     std::uint64_t orderCallbackGeneration_=0,nextCancelAttemptId_=1;
     std::uint64_t eventGeneration_=0,tradeConnectedGeneration_=0,tradeDisconnectedGeneration_=0,loginGeneration_=0,caughtUpGeneration_=0;
     std::string tradeConnectedTime_,tradeDisconnectedTime_,loginTime_,caughtUpTime_;

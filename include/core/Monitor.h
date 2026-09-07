@@ -29,6 +29,7 @@ struct MonitorThresholds {
     int orderCount = 0;
     int cancelCount = 0;
     int duplicateCount = 0;
+    int fillCount = 0;
     bool popupEnabled = false;
 };
 
@@ -38,6 +39,7 @@ public:
     ~Monitor();
     void recordOrder(const OrderIntent& x);
     void recordCancel(const OrderIntent& x);
+    void recordFill();
     void logThresholdConfiguration();
     void logRiskStatistics() const;
     void logDuplicateStatistics() const;
@@ -49,10 +51,12 @@ public:
     int orderCount() const { return orderCount_; }
     int cancelCount() const { return cancelCount_; }
     int duplicateCount() const { return duplicateCount_; }
+    int fillCount() const { return fillCount_; }
     const DuplicateStatistics& duplicateStatistics() const { return duplicateStatistics_; }
     bool orderAlerted() const { return orderAlerted_; }
     bool cancelAlerted() const { return cancelAlerted_; }
     bool duplicateAlerted() const { return duplicateAlerted_; }
+    bool fillAlerted() const { return fillAlerted_; }
 private:
     enum class InstructionType { Open, Close, Cancel };
     std::string key(const OrderIntent& x) const;
@@ -63,12 +67,13 @@ private:
     Logger& log_;
     std::string account_;
     MonitorThresholds thresholds_;
-    int orderCount_=0,cancelCount_=0,duplicateCount_=0;
+    int orderCount_=0,cancelCount_=0,duplicateCount_=0,fillCount_=0;
     DuplicateStatistics duplicateStatistics_;
     bool thresholdConfigurationLogged_=false;
-    bool orderAlerted_=false,cancelAlerted_=false,duplicateAlerted_=false;
+    bool orderAlerted_=false,cancelAlerted_=false,duplicateAlerted_=false,fillAlerted_=false;
     std::unordered_map<std::string,int> seen_;
     std::vector<std::thread> popupThreads_;
+    mutable std::mutex mu_;
 };
 
 class TradingGate {

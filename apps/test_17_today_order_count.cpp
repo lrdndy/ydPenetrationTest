@@ -39,6 +39,7 @@ int main(int argc,char** argv){
         thresholds.orderCount=std::max(0,cfg.getInt("Threshold.OrderCount",0));
         thresholds.cancelCount=std::max(0,cfg.getInt("Threshold.CancelCount",0));
         thresholds.duplicateCount=std::max(0,cfg.getInt("Threshold.DuplicateCount",0));
+        thresholds.fillCount=std::max(0,cfg.getInt("Threshold.FillCount",0));
         thresholds.popupEnabled=cfg.getBool("Threshold.PopupEnabled",false);
         ydtest::Monitor monitor(log,accountId,thresholds);
 

@@ -8,6 +8,7 @@ class OrderValidator {
 public:
     ValidationResult instrument(YDApi* api, const std::string& id) const;
     ValidationResult limitPrice(const YDInstrument* inst, double price) const;
+    ValidationResult limitPriceRange(const YDInstrument* inst, double price) const;
     ValidationResult limitVolume(const YDInstrument* inst, int volume) const;
 };
 }

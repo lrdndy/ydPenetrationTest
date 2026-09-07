@@ -19,7 +19,7 @@ struct Env { Config cfg; std::string runStamp; std::filesystem::path root; std::
 Env makeEnv(const RunOptions& o){Env e; if(!e.cfg.load(o.testConfig)) throw std::runtime_error("cannot load test config: "+o.testConfig);e.runStamp=timestampForPath();e.root=std::filesystem::path(o.outputRoot)/e.runStamp;e.accounts=loadAccountsCsv(o.accounts);if(e.accounts.empty())throw std::runtime_error("no accounts in "+o.accounts);return e;}
 std::string instID(const RunOptions& o,const Config& c){return o.instrument.empty()?c.get("Test.Instrument","au2612"):o.instrument;}
 int timeout(const Config& c){return c.getInt("Test.TimeoutSeconds",12);}
-MonitorThresholds monitorThresholds(const Config& c){return {std::max(0,c.getInt("Threshold.OrderCount",0)),std::max(0,c.getInt("Threshold.CancelCount",0)),std::max(0,c.getInt("Threshold.DuplicateCount",0)),c.getBool("Threshold.PopupEnabled",false)};}
+MonitorThresholds monitorThresholds(const Config& c){return {std::max(0,c.getInt("Threshold.OrderCount",0)),std::max(0,c.getInt("Threshold.CancelCount",0)),std::max(0,c.getInt("Threshold.DuplicateCount",0)),std::max(0,c.getInt("Threshold.FillCount",0)),c.getBool("Threshold.PopupEnabled",false)};}
 std::filesystem::path accountLog(const Env& e,const std::string& id,const Account& a){return e.root/id/(a.label.empty()?a.username:a.label)/"test.log";}
 int combine(int acc,int code){return (acc||code)?1:0;}
 
@@ -1371,29 +1371,33 @@ int runTest06Threshold(const RunOptions& o){return runEach(o,"2.6_threshold",[&]
     const std::string configuration="account="+a.username
         +" orderCountThreshold="+std::to_string(thresholds.orderCount)
         +" cancelCountThreshold="+std::to_string(thresholds.cancelCount)
-        +" duplicateCountThreshold="+std::to_string(thresholds.duplicateCount);
-    if(thresholds.orderCount<=0||thresholds.cancelCount<=0||thresholds.duplicateCount<=0){r.fail("risk threshold configuration",configuration+"; all thresholds must be positive for this run");return;}
+        +" duplicateCountThreshold="+std::to_string(thresholds.duplicateCount)
+        +" fillCountThreshold="+std::to_string(thresholds.fillCount);
+    if(thresholds.orderCount<=0||thresholds.cancelCount<=0||thresholds.duplicateCount<=0||thresholds.fillCount<=0){r.fail("risk threshold configuration",configuration+"; all thresholds must be positive for this run");return;}
 
     Monitor m(l,a.username,thresholds);
     OrderIntent instruction{instID(o,c),YD_D_Buy,YD_OF_Open,100.0,1,false};
     for(int n=0;n<thresholds.orderCount;++n){auto unique=instruction;unique.price+=n;m.recordOrder(unique);}
     for(int n=0;n<thresholds.cancelCount;++n){auto unique=instruction;unique.cancel=true;unique.price+=n;m.recordCancel(unique);}
     for(int n=0;n<thresholds.duplicateCount;++n)m.recordOrder(instruction);
+    for(int n=0;n<thresholds.fillCount;++n)m.recordFill();
     m.logRiskStatistics();
 
     const std::string statistics=configuration
         +" orderCount="+std::to_string(m.orderCount())
         +" cancelCount="+std::to_string(m.cancelCount())
         +" duplicateCount="+std::to_string(m.duplicateCount())
+        +" fillCount="+std::to_string(m.fillCount())
         +" orderAlerted="+(m.orderAlerted()?std::string("true"):std::string("false"))
         +" cancelAlerted="+(m.cancelAlerted()?std::string("true"):std::string("false"))
-        +" duplicateAlerted="+(m.duplicateAlerted()?std::string("true"):std::string("false"));
+        +" duplicateAlerted="+(m.duplicateAlerted()?std::string("true"):std::string("false"))
+        +" fillAlerted="+(m.fillAlerted()?std::string("true"):std::string("false"));
     r.observe("risk threshold monitoring snapshot",statistics);
-    if(!m.orderAlerted()||!m.cancelAlerted()||!m.duplicateAlerted())r.fail("risk threshold monitor internal consistency",statistics);
+    if(!m.orderAlerted()||!m.cancelAlerted()||!m.duplicateAlerted()||!m.fillAlerted())r.fail("risk threshold monitor internal consistency",statistics);
 },false,true);}
 
 namespace {
-enum class InstructionCheckMode { All, InvalidInstrument, InvalidPrice, InvalidVolume };
+enum class InstructionCheckMode { All, InvalidInstrument, InvalidPrice, InvalidVolume, InvalidPriceRange };
 
 int runInstructionCheck(const RunOptions& o,const std::string& id,InstructionCheckMode mode){return runEach(o,id,[&](const Account&a,const Config&c,Logger&l,TestResult&r){
     YdSession s(o.ydConfig,a.username,a.password,l,false,monitorThresholds(c),false);
@@ -1401,21 +1405,23 @@ int runInstructionCheck(const RunOptions& o,const std::string& id,InstructionChe
     const bool checkInstrument=mode==InstructionCheckMode::All||mode==InstructionCheckMode::InvalidInstrument;
     const bool checkPrice=mode==InstructionCheckMode::All||mode==InstructionCheckMode::InvalidPrice;
     const bool checkVolume=mode==InstructionCheckMode::All||mode==InstructionCheckMode::InvalidVolume;
-    const std::string modeName=mode==InstructionCheckMode::All?"ALL":(mode==InstructionCheckMode::InvalidInstrument?"INVALID_INSTRUMENT":(mode==InstructionCheckMode::InvalidPrice?"INVALID_PRICE":"INVALID_VOLUME"));
+    const bool checkPriceRange=mode==InstructionCheckMode::All||mode==InstructionCheckMode::InvalidPriceRange;
+    const std::string modeName=mode==InstructionCheckMode::All?"ALL":(mode==InstructionCheckMode::InvalidInstrument?"INVALID_INSTRUMENT":(mode==InstructionCheckMode::InvalidPrice?"INVALID_PRICE":(mode==InstructionCheckMode::InvalidPriceRange?"INVALID_PRICE_RANGE":"INVALID_VOLUME")));
     const std::string invalidInstrumentId=checkInstrument?(o.instrument.empty()?c.get("Validation.InvalidInstrument","au2617"):o.instrument):std::string();
-    const std::string referenceInstrumentId=(checkPrice||checkVolume)?((!o.instrument.empty()&&mode!=InstructionCheckMode::All)?o.instrument:c.get("Validation.ReferenceInstrument",c.get("Test.Instrument","au2612"))):std::string();
+    const std::string referenceInstrumentId=(checkPrice||checkVolume||checkPriceRange)?((!o.instrument.empty()&&mode!=InstructionCheckMode::All)?o.instrument:c.get("Validation.ReferenceInstrument",c.get("Test.Instrument","au2612"))):std::string();
 
     if(checkInstrument){
         if(invalidInstrumentId.empty()){r.fail("invalid instrument precondition","configure Validation.InvalidInstrument or pass --instrument");return;}
         if(s.instrument(invalidInstrumentId)){r.fail("invalid instrument precondition","instrument="+invalidInstrumentId+" exists at the counter; choose a nonexistent contract code");return;}
     }
     const YDInstrument* instrument=nullptr;
-    if(checkPrice||checkVolume){
+    if(checkPrice||checkVolume||checkPriceRange){
         instrument=s.instrument(referenceInstrumentId);
         if(!instrument){r.fail("reference instrument exists","instrument="+referenceInstrumentId+"; use an existing contract");return;}
         if(instrument->Tick<=0){r.fail("reference instrument tick","instrument="+referenceInstrumentId+" tick must be positive");return;}
     }
     if(checkVolume&&instrument->MaxLimitOrderVolume>=INT_MAX){r.fail("construct over-limit volume","instrument maximum is INT_MAX");return;}
+    if(checkPriceRange&&!instrument->m_pMarketData){r.fail("reference instrument price range","instrument="+referenceInstrumentId+" has no market-data limit price; use an active contract");return;}
 
     const int repeatCount=std::max(1,c.getInt("Validation.RepeatCount",3));
     const int validVolume=instrument?std::max(1,instrument->MinLimitOrderVolume):1;
@@ -1423,6 +1429,26 @@ int runInstructionCheck(const RunOptions& o,const std::string& id,InstructionChe
     const double validPrice=instrument?instrument->Tick*1000.0:1.0;
     const double badPrice=instrument?validPrice+instrument->Tick*0.5:0.0;
     const int badVolume=instrument?instrument->MaxLimitOrderVolume+1:0;
+    double outOfRangePrice=0;
+    if(checkPriceRange){
+        const YDMarketData* md=instrument->m_pMarketData;
+        const double upper=md->UpperLimitPrice;
+        const double lower=md->LowerLimitPrice;
+        const bool hasUpper=std::isfinite(upper)&&upper>0;
+        const bool hasLower=std::isfinite(lower)&&lower>0;
+        if(!hasUpper&&!hasLower){r.fail("reference instrument price range","no usable limit price on instrument="+referenceInstrumentId);return;}
+        if(hasUpper){
+            double above=std::floor(upper/instrument->Tick)*instrument->Tick+instrument->Tick;
+            if(std::fabs(above-upper)<=instrument->Tick*1e-6)above+=instrument->Tick;
+            outOfRangePrice=above;
+        }else{
+            double below=std::ceil(lower/instrument->Tick)*instrument->Tick-instrument->Tick;
+            if(std::fabs(below-lower)<=instrument->Tick*1e-6)below-=instrument->Tick;
+            if(below<=0)below=lower-instrument->Tick;
+            outOfRangePrice=below;
+        }
+        if(outOfRangePrice<=0){r.fail("reference instrument price range","cannot construct an out-of-range price for instrument="+referenceInstrumentId);return;}
+    }
     const OrderActivitySnapshot activityBefore=s.orderActivity();
     const InstructionValidationSnapshot validationBefore=s.instructionValidation();
     bool allReturnedRejected=true;
@@ -1430,15 +1456,18 @@ int runInstructionCheck(const RunOptions& o,const std::string& id,InstructionChe
     if(checkInstrument)for(int n=0;n<repeatCount;++n)allReturnedRejected=s.sendLimitOrder(invalidInstrumentId,YD_D_Buy,YD_OF_Open,validPrice,validVolume)<0&&allReturnedRejected;
     if(checkPrice)for(int n=0;n<repeatCount;++n)allReturnedRejected=s.sendLimitOrder(instrument,YD_D_Buy,YD_OF_Open,badPrice,validVolume)<0&&allReturnedRejected;
     if(checkVolume)for(int n=0;n<repeatCount;++n)allReturnedRejected=s.sendLimitOrder(instrument,YD_D_Buy,YD_OF_Open,validPrice,badVolume)<0&&allReturnedRejected;
+    if(checkPriceRange)for(int n=0;n<repeatCount;++n)allReturnedRejected=s.sendLimitOrder(instrument,YD_D_Buy,YD_OF_Open,outOfRangePrice,validVolume)<0&&allReturnedRejected;
 
     const OrderActivitySnapshot activityAfter=s.orderActivity();
     const InstructionValidationSnapshot validationAfter=s.instructionValidation();
     const std::uint64_t instrumentRejected=validationAfter.invalidInstrument-validationBefore.invalidInstrument;
     const std::uint64_t priceRejected=validationAfter.invalidLimitPrice-validationBefore.invalidLimitPrice;
     const std::uint64_t volumeRejected=validationAfter.invalidLimitVolume-validationBefore.invalidLimitVolume;
+    const std::uint64_t priceRangeRejected=validationAfter.invalidPriceRange-validationBefore.invalidPriceRange;
     const std::uint64_t expectedInstrument=checkInstrument?static_cast<std::uint64_t>(repeatCount):0;
     const std::uint64_t expectedPrice=checkPrice?static_cast<std::uint64_t>(repeatCount):0;
     const std::uint64_t expectedVolume=checkVolume?static_cast<std::uint64_t>(repeatCount):0;
+    const std::uint64_t expectedPriceRange=checkPriceRange?static_cast<std::uint64_t>(repeatCount):0;
     const std::uint64_t apiCalls=activityAfter.orderApiRequests-activityBefore.orderApiRequests;
     const std::uint64_t apiSubmissions=activityAfter.orderRequestsSubmitted-activityBefore.orderRequestsSubmitted;
     const std::string statistics="account="+a.username+" event=INSTRUCTION_CHECK_STATISTICS testPoint="+modeName
@@ -1448,19 +1477,21 @@ int runInstructionCheck(const RunOptions& o,const std::string& id,InstructionChe
         +" invalidInstrumentRejected="+std::to_string(instrumentRejected)
         +" invalidPriceRejected="+std::to_string(priceRejected)
         +" invalidVolumeRejected="+std::to_string(volumeRejected)
+        +" invalidPriceRangeRejected="+std::to_string(priceRangeRejected)
         +" orderApiRequests="+std::to_string(apiCalls)
         +" orderRequestsSubmitted="+std::to_string(apiSubmissions)
         +" apiCalled="+(apiCalls==0?std::string("false"):std::string("true"));
     l.info("VALIDATION",statistics);
     r.observe("trading instruction validation snapshot",statistics);
     if(!allReturnedRejected||instrumentRejected!=expectedInstrument||priceRejected!=expectedPrice||volumeRejected!=expectedVolume
-        ||apiCalls!=0||apiSubmissions!=0)r.fail("trading instruction validation consistency",statistics);
+        ||priceRangeRejected!=expectedPriceRange||apiCalls!=0||apiSubmissions!=0)r.fail("trading instruction validation consistency",statistics);
 },false,true);}
 }
 
 int runTest071InvalidInstrument(const RunOptions& o){return runInstructionCheck(o,"2.7.1_invalid_instrument",InstructionCheckMode::InvalidInstrument);}
 int runTest072InvalidPrice(const RunOptions& o){return runInstructionCheck(o,"2.7.2_invalid_price",InstructionCheckMode::InvalidPrice);}
 int runTest073InvalidVolume(const RunOptions& o){return runInstructionCheck(o,"2.7.3_invalid_volume",InstructionCheckMode::InvalidVolume);}
+int runTest074InvalidPriceRange(const RunOptions& o){return runInstructionCheck(o,"2.7.4_invalid_price_range",InstructionCheckMode::InvalidPriceRange);}
 int runTest07InstructionCheck(const RunOptions& o){return runInstructionCheck(o,"2.7_instruction_check",InstructionCheckMode::All);}
 
 namespace {
@@ -1631,7 +1662,7 @@ int runErrorMessageCase(const RunOptions& o,const std::string& id,ErrorMessageMo
         r.fail("error-message preflight","cannot query baseline long position; no order sent");return;
     }
     l.info("POSITION","account="+accountId+" event=POSITION_SNAPSHOT instrument="+requestedInstrument+" direction=LONG hedge=SPECULATION today="+std::to_string(baselinePosition.today)+" history="+std::to_string(baselinePosition.history)+" other="+std::to_string(baselinePosition.other)+" total="+std::to_string(baselinePosition.total()));
-    const bool existingLongBaselineAllowed=mode==ErrorMessageMode::InsufficientFunds;
+    const bool existingLongBaselineAllowed=mode==ErrorMessageMode::InsufficientFunds||mode==ErrorMessageMode::MarketState;
     if(!existingLongBaselineAllowed&&baselinePosition.total()!=0){
         r.fail("error-message preflight","instrument has existing long speculation position="+std::to_string(baselinePosition.total())+"; choose a zero-position contract; no order sent");return;
     }
@@ -2433,6 +2464,83 @@ int runTest16ManualOrderCount(const RunOptions& o){return runEach(o,"16_manual_o
     if(monitoringPass)r.pass("manual order/cancel count monitoring","account="+accountId+" instrument="+instrumentId+" orderApiRequests="+std::to_string(measuredActivity.orderApiRequests)+" confirmedCancellations="+std::to_string(measuredActivity.confirmedCancellations));
     else r.fail("manual order/cancel count monitoring",line.str());
 },true,false);}
+
+int runTest18FieldValidation(const RunOptions& o){return runEach(o,"18_field_validation",[&](const Account&a,const Config&c,Logger&l,TestResult&r){
+    l.info("SYSTEM","READ_ONLY field validation + fund/position query: no order or cancel API will be called");
+    const int snapshotTimeout=std::max(1,c.getInt("Snapshot.TimeoutSeconds",120));
+    YdSession s(o.ydConfig,a.username,a.password,l,true,monitorThresholds(c),false);
+    if(!readySession(s,r,snapshotTimeout,a.username))return;
+    auto* api=s.extendedApi();
+    if(!api){r.fail("extended API available","required for fund/position query");return;}
+
+    // ---- Empty-value validation: fund account (login username) and broker AppID ----
+    bool fundAccountOk=!a.username.empty();
+    l.info("VALIDATION","account="+(fundAccountOk?a.username:std::string("<empty>"))+" event=FIELD_EMPTY_CHECK field=fundAccount empty="+(fundAccountOk?std::string("false"):std::string("true")));
+    const char* configuredAppId=api->getConfig("AppID");
+    bool appIdOk=configuredAppId&&configuredAppId[0]!='\0';
+    l.info("VALIDATION","account="+a.username+" event=FIELD_EMPTY_CHECK field=brokerAppID empty="+(appIdOk?std::string("false"):std::string("true"))+" value="+(appIdOk?std::string(configuredAppId):std::string("<empty>")));
+    if(fundAccountOk&&appIdOk)r.pass("empty-value validation","fundAccount non-empty; brokerAppID non-empty (SDK login uses AppID as the broker application id)");
+    else r.fail("empty-value validation","fundAccount empty="+std::string(fundAccountOk?"false":"true")+" brokerAppID empty="+std::string(appIdOk?"false":"true"));
+
+    // ---- Special-symbol / binary field validation: instrument, price, volume (local reject, apiCalled=false) ----
+    const std::string instrumentId=instID(o,c);
+    const YDInstrument* instrument=s.instrument(instrumentId);
+    if(!instrument){r.fail("instrument exists","instrument="+instrumentId+"; no order sent");return;}
+    if(instrument->Tick<=0){r.fail("instrument tick","instrument="+instrumentId+" tick must be positive");return;}
+    const int validVolume=std::max(1,instrument->MinLimitOrderVolume);
+    const double validPrice=instrument->Tick*1000.0;
+    const OrderActivitySnapshot before=s.orderActivity();
+    std::uint64_t rejected=0;
+    auto checkReject=[&](const char* field,const std::string& text){
+        bool ok=false;
+        if(std::string(field)=="instrument"){
+            ok=s.sendLimitOrder(text,YD_D_Buy,YD_OF_Open,validPrice,validVolume)<0;
+        }else if(std::string(field)=="price"){
+            ok=s.sendLimitOrder(instrumentId,YD_D_Buy,YD_OF_Open,0.0,validVolume)<0; // price=0 is invalid
+        }else if(std::string(field)=="volume"){
+            ok=s.sendLimitOrder(instrumentId,YD_D_Buy,YD_OF_Open,validPrice,0)<0; // volume=0 is invalid
+        }
+        if(ok)++rejected;
+        l.info("VALIDATION","account="+a.username+" event=FIELD_SPECIAL_CHAR_CHECK field="+field+" rejected="+(ok?std::string("true"):std::string("false")));
+    };
+    checkReject("instrument","au2612@#\x01\x02");   // special chars + binary in instrument code
+    checkReject("price","");                         // price 0 (binary/empty equivalent)
+    checkReject("volume","");                        // volume 0
+    const OrderActivitySnapshot after=s.orderActivity();
+    const std::uint64_t apiCalls=after.orderApiRequests-before.orderApiRequests;
+    const std::uint64_t submissions=after.orderRequestsSubmitted-before.orderRequestsSubmitted;
+    l.info("VALIDATION","account="+a.username+" event=FIELD_VALIDATION_STATISTICS rejectedInstructions="+std::to_string(rejected)+" orderApiRequests="+std::to_string(apiCalls)+" orderRequestsSubmitted="+std::to_string(submissions)+" apiCalled="+(apiCalls==0?std::string("false"):std::string("true")));
+    if(rejected>=3&&apiCalls==0&&submissions==0)r.pass("special-symbol/binary field validation","invalid instrument/price/volume rejected locally; no order sent");
+    else r.fail("special-symbol/binary field validation","rejected="+std::to_string(rejected)+" apiCalls="+std::to_string(apiCalls));
+
+    // ---- Fund + position query sanity ----
+    const YDAccount* ydAccount=api->getMyAccount();
+    if(!ydAccount){r.fail("account identity","getMyAccount returned null");return;}
+    const YDExtendedAccount* ext=api->getExtendedAccount(ydAccount);
+    if(ext){
+        l.info("ACCOUNT","account="+a.username+" event=FUND_SNAPSHOT balance="+snapshotNumber(ext->Balance)+" available="+snapshotNumber(ext->Available)+" closeProfit="+snapshotNumber(ext->CloseProfit)+" positionProfit="+snapshotNumber(ext->PositionProfit)+" margin="+snapshotNumber(ext->Margin));
+        r.pass("fund query","balance="+snapshotNumber(ext->Balance)+" available="+snapshotNumber(ext->Available));
+    }else{
+        l.warn("ACCOUNT","account="+a.username+" fund query unavailable");
+        r.skip("fund query","getExtendedAccount returned null");
+    }
+    YDExtendedPositionFilter filter{};filter.PositionDate=-1;filter.PositionDirection=-1;filter.HedgeFlag=-1;filter.pAccount=ydAccount;
+    struct Destroy{void operator()(YDQueryResult<YDExtendedPosition>* value)const{if(value)value->destroy();}};
+    std::unique_ptr<YDQueryResult<YDExtendedPosition>,Destroy> positions(api->findExtendedPositions(&filter));
+    int nonZero=0;
+    if(positions){
+        for(int index=0;index<positions->getCount();++index){
+            const YDExtendedPosition* pos=positions->get(index);
+            if(pos&&pos->Position>0&&pos->getAccount()==ydAccount)++nonZero;
+        }
+        l.info("POSITION","account="+a.username+" event=POSITION_SNAPSHOT nonZeroPositions="+std::to_string(nonZero));
+        r.pass("position query","account="+a.username+" nonZeroPositions="+std::to_string(nonZero));
+    }else{
+        l.warn("POSITION","account="+a.username+" position query unavailable");
+        r.skip("position query","findExtendedPositions returned null");
+    }
+    r.pass("read-only safety","no order/cancel requests sent");
+},false,false);}
 
 int runTest09PauseTrade(const RunOptions& o){return runEach(o,"2.9_pause_trade",[&](const Account&a,const Config&c,Logger&l,TestResult&r){
     if(o.live){r.fail("trading control safety","test_09 does not accept --live; no order sent");return;}

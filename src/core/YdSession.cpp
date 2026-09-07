@@ -75,7 +75,7 @@ namespace ydtest {
 		{ std::unique_lock<std::mutex> lk(mu_); cv_.wait(lk, [&] {return destroyed_; }); api_ = nullptr; extendedApi_ = nullptr; }
 	}
 	void YdSession::logInstructionMonitoringSummary() {
-		if (instructionMonitoringSummaryLogged_ || (instructionMonitor_.orderCount() == 0 && instructionMonitor_.cancelCount() == 0))return;
+		if (instructionMonitoringSummaryLogged_ || (instructionMonitor_.orderCount() == 0 && instructionMonitor_.cancelCount() == 0 && instructionMonitor_.fillCount() == 0))return;
 		instructionMonitor_.logRiskStatistics(); instructionMonitor_.logDuplicateStatistics(); instructionMonitoringSummaryLogged_ = true;
 	}
 	bool YdSession::waitConnected(int s) { return waitState(s, [&] {return connected_; }); }
@@ -97,7 +97,7 @@ namespace ydtest {
 	YdSession::HistoricalCallbackCounts YdSession::historicalCallbackCounts() const { std::lock_guard<std::mutex> lk(mu_); return { historicalOrderCallbacks_,historicalTradeCallbacks_,historicalCancelCallbacks_,historicalRejectedCallbacks_ }; }
 	YdSession::HistoricalCallbackCounts YdSession::historicalCallbackCounts(const std::string& instrumentId) const { std::lock_guard<std::mutex> lk(mu_); const auto it = historicalByInstrument_.find(instrumentId); return it == historicalByInstrument_.end() ? HistoricalCallbackCounts{} : it->second; }
 	BatchCancelActivitySnapshot YdSession::batchCancelActivity() const { std::lock_guard<std::mutex> lk(mu_); return { batchCancelApiCalls_,batchCancelApiCallsSubmitted_,batchCancelOrdersRequested_,batchCancelOrdersSubmitted_ }; }
-	InstructionValidationSnapshot YdSession::instructionValidation() const { std::lock_guard<std::mutex> lk(mu_); return { invalidInstrumentInstructions_,invalidLimitPriceInstructions_,invalidLimitVolumeInstructions_ }; }
+	InstructionValidationSnapshot YdSession::instructionValidation() const { std::lock_guard<std::mutex> lk(mu_); return { invalidInstrumentInstructions_,invalidLimitPriceInstructions_,invalidLimitVolumeInstructions_,invalidPriceRangeInstructions_ }; }
 	OrderStreamSnapshot YdSession::orderStreamSnapshotLocked() const {
 		OrderStreamSnapshot out;
 		out.activity = { orderApiRequests_,orderRequestsSubmitted_,acceptedOrderRefs_.size(),cancelApiRequests_,cancelRequestsSubmitted_,confirmedCancellations_,failedCancelCallbacks_,callbackValidationFailures_ };
@@ -167,7 +167,7 @@ namespace ydtest {
 	bool YdSession::waitMarketData(int ref, int s, YDMarketData& out) { std::unique_lock<std::mutex> lk(mu_); if (!cv_.wait_for(lk, std::chrono::seconds(s), [&] {return market_.count(ref) > 0; }))return false; out = market_[ref]; return true; }
 	bool YdSession::waitNextMarketData(int ref, std::uint64_t& version, int s, YDMarketData& out) { std::unique_lock<std::mutex> lk(mu_); if (!cv_.wait_for(lk, std::chrono::seconds(s), [&] {auto found = marketVersions_.find(ref); return found != marketVersions_.end() && found->second > version; }))return false; out = market_[ref]; version = marketVersions_[ref]; return true; }
 	void YdSession::logInstructionRejected(const std::string& validation, const std::string& instrumentId, int dir, int off, double price, int vol, const std::string& reason) {
-		{ std::lock_guard<std::mutex> lk(mu_); if (validation == "INSTRUMENT")++invalidInstrumentInstructions_; else if (validation == "LIMIT_PRICE")++invalidLimitPriceInstructions_; else if (validation == "LIMIT_VOLUME")++invalidLimitVolumeInstructions_; }
+		{ std::lock_guard<std::mutex> lk(mu_); if (validation == "INSTRUMENT")++invalidInstrumentInstructions_; else if (validation == "LIMIT_PRICE")++invalidLimitPriceInstructions_; else if (validation == "LIMIT_VOLUME")++invalidLimitVolumeInstructions_; else if (validation == "PRICE_RANGE")++invalidPriceRangeInstructions_; }
 		log_.error("VALIDATION", "account=" + username_ + " event=INSTRUCTION_REJECTED validation=" + validation
 			+ " instrument=" + instrumentId + " direction=" + directionName(dir) + " offset=" + offsetName(off)
 			+ " price=" + numberText(price) + " volume=" + std::to_string(vol) + " reason=" + reason + " apiCalled=false");
@@ -199,6 +199,8 @@ namespace ydtest {
 		if (!instrumentResult.ok) { logInstructionRejected("INSTRUMENT", instrumentId, dir, off, price, vol, instrumentResult.reason); return -1; }
 		const ValidationResult priceResult = validator.limitPrice(i, price);
 		if (!priceResult.ok) { logInstructionRejected("LIMIT_PRICE", instrumentId, dir, off, price, vol, priceResult.reason); return -1; }
+		const ValidationResult rangeResult = validator.limitPriceRange(i, price);
+		if (!rangeResult.ok) { logInstructionRejected("PRICE_RANGE", instrumentId, dir, off, price, vol, rangeResult.reason); return -1; }
 		const ValidationResult volumeResult = validator.limitVolume(i, vol);
 		if (!volumeResult.ok) { logInstructionRejected("LIMIT_VOLUME", instrumentId, dir, off, price, vol, volumeResult.reason); return -1; }
 		if (!liveOrderSubmissionEnabled_) { log_.error("RISK", "account=" + username_ + " event=LIVE_ORDER_BLOCKED instrument=" + instrumentId + " reason=YdSession live order submission is disabled apiCalled=false"); return -1; }
@@ -526,6 +528,7 @@ namespace ydtest {
 			}
 			cv_.notify_all();
 		}
+		if (shouldLog)instructionMonitor_.recordFill();
 		const std::string account = accountName(a, username_); const std::string instrument = i ? std::string(i->InstrumentID) : std::string();
 		if (validationFailed)log_.warn("VALIDATION", "ignored trade callback account=" + account + " ref=" + std::to_string(t->OrderRef) + " instrument=" + instrument + " reason=" + validationReason + " orderSysId=" + systemOrderIdText(t->OrderSysID, t->LongOrderSysID));
 		if (!shouldLog)return; std::ostringstream s; s << "notifyTrade account=" << account << " ref=" << t->OrderRef << " instrument=" << instrument << " direction=" << directionName(t->Direction) << " offset=" << offsetName(t->OffsetFlag) << " tradePrice=" << numberText(t->Price) << " volume=" << t->Volume << " tradeId=" << (isAssignedYdId(t->LongTradeID) ? t->LongTradeID : static_cast<long long>(t->TradeID)) << " orderSysId=" << systemOrderIdText(t->OrderSysID, t->LongOrderSysID); log_.info("TRADE", s.str());

@@ -52,13 +52,22 @@ Monitor::InstructionType Monitor::instructionType(const OrderIntent& x) const {
 }
 
 void Monitor::recordOrder(const OrderIntent& x) {
+    std::lock_guard<std::mutex> lock(mu_);
     ++orderCount_;
     record(x);
 }
 
 void Monitor::recordCancel(const OrderIntent& x) {
+    std::lock_guard<std::mutex> lock(mu_);
     ++cancelCount_;
     record(x);
+}
+
+void Monitor::recordFill() {
+    std::lock_guard<std::mutex> lock(mu_);
+    logThresholdConfiguration();
+    ++fillCount_;
+    checkThresholds();
 }
 
 void Monitor::record(const OrderIntent& x) {
@@ -119,6 +128,7 @@ void Monitor::logThresholdConfiguration() {
         + " orderCountThreshold=" + std::to_string(thresholds_.orderCount)
         + " cancelCountThreshold=" + std::to_string(thresholds_.cancelCount)
         + " duplicateCountThreshold=" + std::to_string(thresholds_.duplicateCount)
+        + " fillCountThreshold=" + std::to_string(thresholds_.fillCount)
         + " popupEnabled=" + (thresholds_.popupEnabled ? std::string("true") : std::string("false")));
 }
 
@@ -133,6 +143,7 @@ void Monitor::alertOnTodayCounts(std::uint64_t orderTotal, std::uint64_t cancelT
 }
 
 void Monitor::logRiskStatistics() const {
+    std::lock_guard<std::mutex> lock(mu_);
     log_.info("MONITOR", "account=" + account_
         + " event=RISK_STATISTICS"
         + " orderCount=" + std::to_string(orderCount_)
@@ -143,10 +154,14 @@ void Monitor::logRiskStatistics() const {
         + " cancelAlerted=" + (cancelAlerted_ ? std::string("true") : std::string("false"))
         + " duplicateCount=" + std::to_string(duplicateCount_)
         + " duplicateCountThreshold=" + std::to_string(thresholds_.duplicateCount)
-        + " duplicateAlerted=" + (duplicateAlerted_ ? std::string("true") : std::string("false")));
+        + " duplicateAlerted=" + (duplicateAlerted_ ? std::string("true") : std::string("false"))
+        + " fillCount=" + std::to_string(fillCount_)
+        + " fillCountThreshold=" + std::to_string(thresholds_.fillCount)
+        + " fillAlerted=" + (fillAlerted_ ? std::string("true") : std::string("false")));
 }
 
 void Monitor::logDuplicateStatistics() const {
+    std::lock_guard<std::mutex> lock(mu_);
     std::ostringstream line;
     line << "account=" << account_
          << " event=DUPLICATE_STATISTICS"
@@ -182,5 +197,6 @@ void Monitor::checkThresholds(){
     if(thresholds_.orderCount>0 && orderCount_>=thresholds_.orderCount && !orderAlerted_){orderAlerted_=true;emitAlert("ORDER_COUNT_THRESHOLD",orderCount_,thresholds_.orderCount);}
     if(thresholds_.cancelCount>0 && cancelCount_>=thresholds_.cancelCount && !cancelAlerted_){cancelAlerted_=true;emitAlert("CANCEL_COUNT_THRESHOLD",cancelCount_,thresholds_.cancelCount);}
     if(thresholds_.duplicateCount>0 && duplicateCount_>=thresholds_.duplicateCount && !duplicateAlerted_){duplicateAlerted_=true;emitAlert("DUPLICATE_ORDER_THRESHOLD",duplicateCount_,thresholds_.duplicateCount);}
+    if(thresholds_.fillCount>0 && fillCount_>=thresholds_.fillCount && !fillAlerted_){fillAlerted_=true;emitAlert("FILL_COUNT_THRESHOLD",fillCount_,thresholds_.fillCount);}
 }
 }
